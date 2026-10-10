@@ -48,11 +48,11 @@ environment override takes precedence (use `cargo +1.98.0` to select it explicit
 
 Authenticated endpoints:
 
-| Path | What it answers |
-| --- | --- |
-| `/_bus/health` | Is the source ready? Returns 503 while disconnected. |
+| Path                  | What it answers                                                                                           |
+| --------------------- | --------------------------------------------------------------------------------------------------------- |
+| `/_bus/health`        | Is the source ready? Returns 503 while disconnected.                                                      |
 | `/_bus/subscriptions` | Which live subscriptions are legacy/pending/active, which Sessions they follow, and their queue pressure. |
-| `/_bus/metrics` | Prometheus counters and gauges for source traffic and routing admissions. |
+| `/_bus/metrics`       | Prometheus counters and gauges for source traffic and routing admissions.                                 |
 
 Source failure closes downstream streams and invalidates subscription IDs.
 Clients reconnect and refresh through their existing connection logic. Streams
@@ -61,12 +61,12 @@ silently losing frames or holding up other clients.
 
 ## Layout and verification
 
-| Crate | Owns |
-| --- | --- |
+| Crate             | Owns                                                                        |
+| ----------------- | --------------------------------------------------------------------------- |
 | `crates/protocol` | Ordinary scoped events, shared selection contract, control and SSE decoding |
-| `crates/router` | Session index, atomic interest replacement, bounded queues, epochs |
-| `crates/gateway` | Authentication, source lifecycle, HTTP and WebSocket transport |
-| `crates/daemon` | CLI, tracing, process supervision and shutdown |
+| `crates/router`   | Session index, atomic interest replacement, bounded queues, epochs          |
+| `crates/gateway`  | Authentication, source lifecycle, HTTP and WebSocket transport              |
+| `crates/daemon`   | CLI, tracing, process supervision and shutdown                              |
 
 ```sh
 cargo test --workspace --locked
@@ -82,6 +82,7 @@ in-memory origin, and exercises its real Bus, ordinary HTTP stream, and unchange
 client/controller code against the compiled proxy.
 
 See [operations](doc/event-multiplexer/operations.md),
-[verification and measured results](doc/event-multiplexer/verification.md),
+[current verification](doc/event-multiplexer/additive-verification.md),
+[earlier measurements](doc/event-multiplexer/verification.md),
 [architecture](design/event-multiplexer/architecture.md), and the
 [additive-event contract](design/event-multiplexer/additive-events.md).

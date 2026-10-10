@@ -79,6 +79,7 @@ The public GET response advertises:
 ```http
 Content-Type: text/event-stream
 OpenCode-Event-Scope: 1
+Access-Control-Expose-Headers: OpenCode-Event-Scope
 ```
 
 Header names are case-insensitive. Version 1 means the authoritative scope
@@ -86,10 +87,16 @@ semantics above; absence or another version is not proof of support. The proxy
 requires version 1 instead of guessing scope from a payload. Ordinary clients
 need not examine the header.
 
+Wire preservation refers to JSON data after SSE decoding. Native compact JSON is
+forwarded byte-for-byte; the proxy does not parse/re-serialize the event payload.
+SSE line endings are normalized by decoding, and literal CR/CRLF pretty-print
+whitespace passed directly to the framing helper normalizes to LF. Numeric
+lexemes, escapes, duplicate keys, scope, and payload bytes otherwise remain intact.
+
 The first data item is the existing normal `server.connected` event:
 
 ```json
-{"id":"evt_connection","type":"server.connected","data":{}}
+{ "id": "evt_connection", "type": "server.connected", "data": {} }
 ```
 
 The origin installs observation before sending it. Its ID names that upstream
@@ -137,13 +144,13 @@ filtering.
 
 ## Route simplification
 
-| Route | Disposition |
-| --- | --- |
-| `GET /api/event` | Ordinary unfiltered public stream; gains scoped business events and capability header; sole proxy uplink. |
-| `GET /api/experimental/event/source` | Remove from native protocol/server/generated clients and Rust source configuration. |
-| `GET /api/experimental/event` | Retain existing controlled handshake for existing bus-smart clients. |
-| `PUT /api/experimental/event/subscriptions/:id/interests` | Retain complete replacement; it represents genuine mutable subscription state. |
-| Other OpenCode API and WebSocket routes | Continue ordinary gateway forwarding. |
+| Route                                                     | Disposition                                                                                               |
+| --------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| `GET /api/event`                                          | Ordinary unfiltered public stream; gains scoped business events and capability header; sole proxy uplink. |
+| `GET /api/experimental/event/source`                      | Remove from native protocol/server/generated clients and Rust source configuration.                       |
+| `GET /api/experimental/event`                             | Retain existing controlled handshake for existing bus-smart clients.                                      |
+| `PUT /api/experimental/event/subscriptions/:id/interests` | Retain complete replacement; it represents genuine mutable subscription state.                            |
+| Other OpenCode API and WebSocket routes                   | Continue ordinary gateway forwarding.                                                                     |
 
 The controlled GET/PUT cannot simply disappear: existing clients use their
 activation and in-place replacement contract. Routing information on publications
@@ -222,5 +229,9 @@ documentation. Preserve earlier design and verification receipts as history.
   `packages/protocol/fixtures/event-scope-v1.json`. Rust vendors an identical copy
   at `crates/protocol/fixtures/event-scope-v1.json`; the real cross-repository
   compatibility check asserts byte equality. The fixture includes the capability
-  header/version and focused type list. The native classifier and Rust classifier
-  are checked against it.
+  header/version, focused type list, parsed examples, and raw JSON `wireCases`.
+  The raw cases validate the routing-metadata boundary using native JSON.parse /
+  EventScope and Rust decode_event; they do not duplicate native full business-
+  payload validation. Accepted cases carry expected routes; rejected cases cover
+  malformed scope. Optional raw SSE samples make newline normalization explicit.
+  Both implementations are checked against this same fixture.

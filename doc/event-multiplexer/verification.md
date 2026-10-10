@@ -1,5 +1,10 @@
 # Implementation and verification — 2026-10-10
 
+**First-build record.** The later
+[ordinary scoped-event migration](additive-verification.md) replaces the private
+source route and envelopes described here. This record preserves the original
+checks, review corrections, and benchmark conditions.
+
 ## Outcome
 
 The four-crate Rust gateway and additive bus-smart source export are implemented.
@@ -21,28 +26,28 @@ CPU or execution latency.
 
 ## Checks
 
-| Check | Result |
-| --- | --- |
-| `cargo +1.98.0 test --workspace --locked` | 51 passed: protocol 20, router 22, gateway 9 |
-| Final gateway tests after source-failure logging refinement | 9 passed |
-| `cargo +1.98.0 clippy --workspace --all-targets --locked -- -D warnings` | Passed |
-| `cargo +1.98.0 fmt --all -- --check` | Passed |
-| `cargo +1.98.0 build --release --locked` | Passed |
-| `BUS_PROXY_BINARY=target/release/opencode-bus-proxy bun run test/compatibility/clients.ts` | Passed against final release binary |
-| Bus-smart server focused suite | 32 passed |
-| Bus-smart client event/controlled suite | 20 passed |
-| Bus-smart protocol event suite | 7 passed |
-| Bus-smart server/client/protocol typechecks and client regeneration | Passed |
-| Bus-smart root `bun run check` | Passed with existing lint warnings |
+| Check                                                                                      | Result                                       |
+| ------------------------------------------------------------------------------------------ | -------------------------------------------- |
+| `cargo +1.98.0 test --workspace --locked`                                                  | 51 passed: protocol 20, router 22, gateway 9 |
+| Final gateway tests after source-failure logging refinement                                | 9 passed                                     |
+| `cargo +1.98.0 clippy --workspace --all-targets --locked -- -D warnings`                   | Passed                                       |
+| `cargo +1.98.0 fmt --all -- --check`                                                       | Passed                                       |
+| `cargo +1.98.0 build --release --locked`                                                   | Passed                                       |
+| `BUS_PROXY_BINARY=target/release/opencode-bus-proxy bun run test/compatibility/clients.ts` | Passed against final release binary          |
+| Bus-smart server focused suite                                                             | 32 passed                                    |
+| Bus-smart client event/controlled suite                                                    | 20 passed                                    |
+| Bus-smart protocol event suite                                                             | 7 passed                                     |
+| Bus-smart server/client/protocol typechecks and client regeneration                        | Passed                                       |
+| Bus-smart root `bun run check`                                                             | Passed with existing lint warnings           |
 
 The broader client run had 62 passing tests and three failures. The origin agent
 reproduced **the same three failures and 19 assertions** in an isolated pre-source
 workspace at bus-smart `0de07ec3` (`1a5d9f36-`), using the same installed dependencies:
 
-| Existing test | Failure |
-| --- | --- |
-| `test/promise.test.ts`: “exposes every standard HTTP API group” | Expects integration connect keys `["key"]`; receives `["key", "external"]`. |
-| `test/promise.test.ts`: “session methods use the public HTTP contract” | Expects interrupt query `?continue=true`; actual URL omits it. |
+| Existing test                                                                     | Failure                                                                      |
+| --------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| `test/promise.test.ts`: “exposes every standard HTTP API group”                   | Expects integration connect keys `["key"]`; receives `["key", "external"]`.  |
+| `test/promise.test.ts`: “session methods use the public HTTP contract”            | Expects interrupt query `?continue=true`; actual URL omits it.               |
 | `test/effect.test.ts`: “session methods retain decoded Effect inputs and outputs” | Numeric fixture `idle` is supplied where decoded `DateTime.Utc` is required. |
 
 Those test files and session/integration protocol definitions were unchanged by
@@ -110,11 +115,11 @@ The [router benchmark record](../../crates/router/README.md#recorded-verificatio
 contains the full command, hardware, compiler, trials, and interpretation. For
 128 clients, 20,000 inputs, and 590-byte encoded frames, three-trial medians were:
 
-| Case | Input events/s | Deliveries/s |
-| --- | ---: | ---: |
-| One indexed follower | 162,610 | 162,610 |
-| Broad / 128 followers | 12,392 | 1,586,221 |
-| No followers | 178,840 | 0 |
+| Case                  | Input events/s | Deliveries/s |
+| --------------------- | -------------: | -----------: |
+| One indexed follower  |        162,610 |      162,610 |
+| Broad / 128 followers |         12,392 |    1,586,221 |
+| No followers          |        178,840 |            0 |
 
 Counts, byte totals, payloads, and final cleanup were validated with zero
 overflows. These runs used the host's installed nightly and a disabled tracing
