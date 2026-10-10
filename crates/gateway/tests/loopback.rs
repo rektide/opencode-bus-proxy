@@ -28,6 +28,87 @@ use tokio_util::sync::CancellationToken;
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
+#[derive(Clone, Default)]
+struct TraceCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+impl std::io::Write for TraceCapture {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for TraceCapture {
+    type Writer = Self;
+    fn make_writer(&'a self) -> Self {
+        self.clone()
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn lifecycle_tracing_uses_only_bounded_redacted_http_metadata() {
+    let capture = TraceCapture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_env_filter("bus_proxy_gateway=debug")
+        .with_span_events(
+            tracing_subscriber::fmt::format::FmtSpan::NEW
+                | tracing_subscriber::fmt::format::FmtSpan::CLOSE,
+        )
+        .with_writer(capture.clone())
+        .finish();
+    // One integration-process subscriber covers independently spawned Tokio tasks
+    // and concurrent test runtimes; a thread-local default misses task dispatches.
+    tracing::subscriber::set_global_default(subscriber).unwrap();
+    let mut harness = Harness::new().await;
+    let source = harness.sources.recv().await.unwrap();
+    harness.ready().await;
+    let mut feed = harness.feed(true).await;
+    let id = feed.next().await.unwrap()["data"]["subscriptionID"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(harness.interest(&id, "ses_private").await, 204);
+    let response = harness
+        .client
+        .request(harness.request(
+            "GET",
+            "/private-operation-name?auth_token=private-query-secret",
+            full(Bytes::new()),
+        ))
+        .await
+        .unwrap();
+    response.into_body().collect().await.unwrap();
+    source
+        .send(event("broadcast", None, "private-event-payload"))
+        .await
+        .unwrap();
+    assert_eq!(feed.next().await.unwrap()["type"], "server.connected");
+    assert_eq!(feed.next().await.unwrap()["id"], "private-event-payload");
+    drop(feed);
+    harness.close().await;
+    let captured = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+    assert!(captured.contains("source_attempt"));
+    assert!(captured.contains("source_epoch"));
+    assert!(captured.contains("source epoch retired"));
+    assert!(captured.contains("http_request"));
+    assert!(captured.contains("interests"));
+    assert!(captured.contains("forward"));
+    for sensitive in [
+        &id,
+        "ses_private",
+        "private-operation-name",
+        "auth_token",
+        "private-query-secret",
+        "private-event-payload",
+        &STANDARD.encode("opencode:secret"),
+    ] {
+        assert!(!captured.contains(sensitive), "leaked {sensitive}");
+    }
+}
+
 #[tokio::test]
 async fn connection_limits_must_be_positive() {
     for config in [

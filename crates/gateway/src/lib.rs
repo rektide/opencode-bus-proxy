@@ -29,6 +29,7 @@ use tokio::{
     task::JoinSet,
 };
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
+use tracing::Instrument;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type Body = UnsyncBoxBody<Bytes, BoxError>;
@@ -179,7 +180,13 @@ pub async fn serve(
                         // connection driver, so tunnels share the same admission cap.
                         request.extensions_mut().insert(service_permit.clone());
                         let state = service_state.clone();
-                        async move { Ok::<_, Infallible>(handle(request, state).await) }
+                        let span = tracing::info_span!("http_request", method = method_category(request.method()), route = route_category(request.uri().path()));
+                        async move {
+                            tracing::debug!("HTTP request started");
+                            let response = handle(request, state).await;
+                            tracing::debug!(status = response.status().as_u16(), "HTTP response established");
+                            Ok::<_, Infallible>(response)
+                        }.instrument(span)
                     });
                     let connection = hyper::server::conn::http1::Builder::new()
                         .timer(TokioTimer::new()).header_read_timeout(state.config.header_read_timeout)
@@ -218,14 +225,35 @@ async fn source_owner(state: Arc<State>) {
         if state.shutdown.is_cancelled() {
             break;
         }
-        let mut epoch = None;
-        let result = tokio::select! {
-            biased;
-            _ = state.shutdown.cancelled() => Ok(()),
-            result = source_connection(&state, &mut epoch) => result,
-        };
-        if let Some(epoch) = epoch {
-            let _ = state.router.end_epoch(epoch).await;
+        let attempt_span = tracing::info_span!("source_attempt", attempt);
+        let (result, was_ready) = async {
+            // This lifetime starts as a candidate connection; readiness records its
+            // epoch. Keep retirement inside the same span, even during shutdown.
+            let epoch_span = tracing::info_span!("source_epoch", epoch = tracing::field::Empty);
+            async {
+                tracing::debug!("source attempt started");
+                let mut epoch = None;
+                let result = tokio::select! {
+                    biased;
+                    _ = state.shutdown.cancelled() => Ok(()),
+                    result = source_connection(&state, &mut epoch) => result,
+                };
+                let was_ready = epoch.is_some();
+                if let Some(epoch) = epoch {
+                    let _ = state.router.end_epoch(epoch).await;
+                    tracing::info!(
+                        shutdown = state.shutdown.is_cancelled(),
+                        "source epoch retired"
+                    );
+                }
+                (result, was_ready)
+            }
+            .instrument(epoch_span)
+            .await
+        }
+        .instrument(attempt_span)
+        .await;
+        if was_ready {
             attempt = 0;
         }
         if state.shutdown.is_cancelled() {
@@ -304,6 +332,7 @@ async fn source_connection(state: &State, epoch: &mut Option<String>) -> Result<
                         epoch: new,
                     } if epoch.is_none() => {
                         state.router.begin_epoch(new.clone()).await?;
+                        tracing::Span::current().record("epoch", &new);
                         *epoch = Some(new);
                         tracing::info!("event source ready");
                     }
@@ -322,6 +351,36 @@ async fn source_connection(state: &State, epoch: &mut Option<String>) -> Result<
                 }
             }
         }
+    }
+}
+
+fn method_category(method: &Method) -> &'static str {
+    match *method {
+        Method::GET => "GET",
+        Method::PUT => "PUT",
+        Method::POST => "POST",
+        Method::PATCH => "PATCH",
+        Method::DELETE => "DELETE",
+        Method::HEAD => "HEAD",
+        Method::OPTIONS => "OPTIONS",
+        Method::CONNECT => "CONNECT",
+        Method::TRACE => "TRACE",
+        _ => "OTHER",
+    }
+}
+fn route_category(path: &str) -> &'static str {
+    if is_source_path(path) {
+        return "private_source";
+    }
+    match path {
+        "/api/event" => "legacy_feed",
+        "/api/experimental/event" => "controlled_feed",
+        "/_bus/health" => "health",
+        "/_bus/subscriptions" => "subscriptions",
+        "/_bus/metrics" => "metrics",
+        _ if control_id(path).is_some() => "interests",
+        _ if path.starts_with("/_bus/") => "diagnostics",
+        _ => "forward",
     }
 }
 
