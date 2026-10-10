@@ -495,3 +495,38 @@ async fn invalid_limits_and_unready_subscribe_do_not_panic() {
     token.cancel();
     task.await.unwrap();
 }
+
+#[tokio::test]
+async fn canceling_idle_receive_does_not_lose_later_frame_or_close_subscription() {
+    let fixture = Fixture::new(Limits::default()).await;
+    let mut subscription = activate(&fixture.router, &["a"]).await;
+    assert!(
+        timeout(Duration::from_millis(1), subscription.recv())
+            .await
+            .is_err()
+    );
+    fixture
+        .router
+        .publish(
+            "one".into(),
+            session(Some("a")),
+            Bytes::from_static(b"after-canceled-recv"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        recv(&mut subscription).await.unwrap(),
+        "after-canceled-recv"
+    );
+    assert_eq!(
+        fixture
+            .router
+            .snapshot()
+            .await
+            .unwrap()
+            .gauges
+            .subscriptions,
+        1
+    );
+    fixture.done().await;
+}

@@ -278,6 +278,8 @@ enum Command {
     Publish(String, Route, Bytes, Reply<()>),
     Snapshot(Reply<Snapshot>),
     Remove(String),
+    #[cfg(test)]
+    Panic,
 }
 
 // Only the actor installs/removes epochs. External end_epoch can cancel the
@@ -527,6 +529,8 @@ impl Actor {
                 let _ = reply.send(Ok(self.snapshot()));
             }
             Command::Remove(id) => self.remove(&id),
+            #[cfg(test)]
+            Command::Panic => panic!("router fault-injection test"),
         }
     }
 
@@ -854,5 +858,43 @@ mod tests {
         queue.close();
         assert!(queue.is_closed());
         assert_eq!(queue.sample(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn actor_panic_unwind_guard_discards_backlog_and_wakes_receivers() {
+        let (router, shutdown, task) = router(2).await;
+        let mut subscription = router.subscribe(Mode::Legacy).await.unwrap();
+        router
+            .commands
+            .try_send(Command::Panic)
+            .unwrap_or_else(|_| panic!("empty mailbox"));
+        assert!(task.await.unwrap_err().is_panic());
+        assert!(subscription.recv().await.is_none());
+        assert_eq!(subscription.queue.sample(), (0, 0));
+        assert_eq!(router.snapshot().await.unwrap_err(), RouterError::Closed);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn old_end_command_cannot_retire_new_epoch() {
+        let (router, shutdown, task) = router(2).await;
+        let (begin_reply, begin_ack) = oneshot::channel();
+        let (end_reply, end_ack) = oneshot::channel();
+        router
+            .commands
+            .try_send(Command::Begin("two".into(), begin_reply))
+            .unwrap_or_else(|_| panic!("empty mailbox"));
+        router
+            .commands
+            .try_send(Command::End("one".into(), end_reply))
+            .unwrap_or_else(|_| panic!("one available slot"));
+        begin_ack.await.unwrap().unwrap();
+        end_ack.await.unwrap().unwrap();
+        assert_eq!(
+            router.snapshot().await.unwrap().epoch.as_deref(),
+            Some("two")
+        );
+        shutdown.cancel();
+        task.await.unwrap();
     }
 }
