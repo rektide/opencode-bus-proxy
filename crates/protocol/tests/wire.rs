@@ -136,29 +136,23 @@ fn future_broad_event_is_not_schema_decoded_or_reserialized() {
 }
 
 #[test]
-fn ready_structure_but_not_version_or_epoch_policy_is_checked() {
+fn connected_brand_and_plain_event_structure_are_checked() {
     assert!(matches!(
         decode_event(Bytes::from_static(br#"{"type":"server.connected","id":"evt_any-brand"}"#)).unwrap(),
         UpstreamEvent::Connected { epoch } if epoch == "evt_any-brand"
     ));
     for input in [
-        r#"{"type":"event-source.ready","version":-1,"epoch":"e"}"#,
-        r#"{"type":"event-source.ready","version":4294967296,"epoch":"e"}"#,
-        r#"{"type":"event-source.ready","version":1.0,"epoch":"e"}"#,
-        r#"{"type":"event-source.ready","version":1,"epoch":null}"#,
-        r#"{"type":"event-source.ready","version":1}"#,
-        r#"{"type":"event-source.ready","data":{"version":1,"epoch":"e"}}"#,
-        r#"{"type":"event-source.event","event":{},"route":{"kind":"other"}}"#,
-        r#"{"type":"event-source.event","event":{},"route":{"kind":"session","sessionID":null}}"#,
-        r#"{"type":"event-source.event","event":{},"route":{"kind":"session","sessionID":2}}"#,
-        r#"{"type":"event-source.event","event":{}}"#,
-        r#"{"type":"event-source.event","route":{"kind":"broadcast"}}"#,
-        r#"{"type":"event-source.event","event":null,"route":{"kind":"broadcast"}}"#,
-        r#"{"type":"event-source.event","event":[],"route":{"kind":"broadcast"}}"#,
-        r#"{"type":"event-source.event","event":"x","route":{"kind":"broadcast"}}"#,
-        r#"{"type":"unknown"}"#,
-        r#"{"type":"event-source.ready","type":"event-source.event"}"#,
-        r#"{"type":"event-source.ready","version":1,"epoch":"e"} trailing"#,
+        r#"null"#,
+        r#"[]"#,
+        r#"42"#,
+        r#"{}"#,
+        r#"{"type":null,"scope":{}}"#,
+        r#"{"type":42,"scope":{}}"#,
+        r#"{"type":"server.connected"}"#,
+        r#"{"type":"server.connected","id":null}"#,
+        r#"{"type":"server.connected","id":42}"#,
+        r#"{"type":"server.connected","id":""}"#,
+        r#"{"type":"future","scope":{}} trailing"#,
     ] {
         assert!(
             decode_event(Bytes::copy_from_slice(input.as_bytes())).is_err(),

@@ -89,7 +89,7 @@ async fn lifecycle_tracing_uses_only_bounded_redacted_http_metadata() {
     assert_eq!(feed.next().await.unwrap()["id"], "private-event-payload");
     source
         .send(Bytes::from_static(
-            b"data: {\"type\":\"event-source.ready\",\"version\":\"private-source-value\",\"epoch\":\"bad\"}\n\n",
+            b"data: {\"type\":\"future\",\"scope\":{\"sessionID\":\"private-source-value\"}}\n\n",
         ))
         .await
         .unwrap();
