@@ -50,6 +50,14 @@ struct Arguments {
     #[arg(long, default_value_t = Limits::default().max_subscribers, value_parser = positive)]
     max_subscribers: usize,
 
+    /// Concurrent HTTP connections, including upgraded tunnels.
+    #[arg(long, default_value_t = 1024, value_parser = positive)]
+    max_connections: usize,
+
+    /// Deadline for reading inbound HTTP headers.
+    #[arg(long, default_value_t = 10, value_parser = positive)]
+    header_read_seconds: usize,
+
     #[arg(long, default_value_t = Limits::default().command_capacity, value_parser = positive)]
     command_capacity: usize,
 
@@ -60,7 +68,7 @@ struct Arguments {
     #[arg(long, default_value_t = 45, value_parser = positive)]
     source_idle_seconds: usize,
 
-    /// Request/header establishment timeout, not a stream lifetime limit.
+    /// Upstream connect/source/upgrade setup timeout, not an API execution limit.
     #[arg(long, default_value_t = 10, value_parser = positive)]
     request_timeout_seconds: usize,
 
@@ -107,7 +115,8 @@ async fn main() -> Result<()> {
         max_source_frame_bytes: args.max_source_frame_bytes,
         source_idle_timeout: Duration::from_secs(args.source_idle_seconds as u64),
         request_timeout: Duration::from_secs(args.request_timeout_seconds as u64),
-        ..Config::default()
+        max_connections: args.max_connections,
+        header_read_timeout: Duration::from_secs(args.header_read_seconds as u64),
     };
     let listener = TcpListener::bind(args.listen).await?;
     let address = listener.local_addr()?;
