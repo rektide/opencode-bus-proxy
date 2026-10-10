@@ -89,3 +89,28 @@ and final cleanup. A FIFO sentinel drains tails rather than hiding losses behind
 source-reset cancellation. Reported duration includes the awaited source admission
 hop, concurrent queue drains, and final sentinel, but excludes setup/handshakes.
 It is not an SSE decoder, socket, origin-CPU, or whole-deployment benchmark.
+
+### Recorded verification (2026-10-10)
+
+`cargo test -p bus-proxy-router`: 22 tests passed. Coverage includes native ID/
+ready shape, activation/replacement cuts, concurrent admission, legacy selection,
+count/byte/activation overflow, stale epochs, out-of-band cancellation with full
+commands, periodic Drop reaping, abandoned acknowledgments, actor panic/abort,
+cancel-safe receive, serializable inspection, and retained/bounded-volume spans.
+`cargo clippy -p bus-proxy-router --all-targets -- -D warnings` passed.
+
+Release command above, three repeated trials after compilation: AMD Ryzen 7 5800X,
+16 logical CPUs available, four Tokio workers, installed Rust 1.101 nightly;
+128 controlled clients, 20,000 source events, 590-byte encoded frames. No CPU
+pinning or exclusive host isolation; tracing collector disabled. Shared-host
+variation is visible, so these are descriptive local results, not a capacity SLA.
+
+| Case | Median events/s | Median deliveries/s | Events/s range | Validated deliveries per trial |
+| --- | ---: | ---: | ---: | ---: |
+| Selective (one indexed follower) | 162,610 | 162,610 | 161,714–167,425 | 20,000 |
+| Broad (128 followers) | 12,392 | 1,586,221 | 12,350–12,418 | 2,560,000 |
+| No followers (clients still attached) | 178,840 | 0 | 169,904–180,497 | 0 |
+
+Every trial verified counters, byte totals and payloads with zero overflows and
+zero subscriptions remaining. The final FIFO sentinel's admissions are validated
+separately and excluded from the reported domain delivery count.
