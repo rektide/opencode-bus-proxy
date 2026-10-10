@@ -90,6 +90,8 @@ pub struct Config {
     pub max_source_frame_bytes: usize,
     pub source_idle_timeout: std::time::Duration,
     pub request_timeout: std::time::Duration,
+    pub max_connections: usize,
+    pub header_read_timeout: std::time::Duration,
 }
 pub async fn serve(
     listener: tokio::net::TcpListener,
@@ -101,8 +103,10 @@ pub async fn serve(
 
 `Config: Default`; default upstream `http://127.0.0.1:4096`, username `opencode`,
 source frame limit 16 MiB, source idle 45 seconds (origin heartbeats at 15),
-request/header establishment timeout 10 seconds. No whole-response timeout for
-streams. Daemon validates a nonempty shared password unless explicit
+connect/source/upgrade setup timeout 10 seconds, inbound HTTP header deadline
+10 seconds, and 1024 concurrent HTTP connections including upgrades. Ordinary
+forwarded API execution/upload/response duration is not time-limited by these
+setup deadlines. Daemon validates a nonempty shared password unless explicit
 `--allow-unauthenticated` is chosen. The same password protects origin and local
 routes and supplies source Basic credentials. Pairing-session HMAC and Basic/
 query/cookie behavior must mirror the checked-out native auth; preserve external

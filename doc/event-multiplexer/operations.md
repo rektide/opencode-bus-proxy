@@ -48,8 +48,11 @@ Use `--help` for current defaults. The configurable limits are:
   limits its complete encoded frame to 16 MiB.
 - `--source-idle-seconds`: counts any source bytes, including 15-second heartbeat
   comments. A stalled source cannot hide behind proxy heartbeats indefinitely.
-- `--request-timeout-seconds`: connection/response-header deadline, not a limit
-  on a successful long-lived response body.
+- `--request-timeout-seconds`: upstream connection/source/upgrade setup deadline.
+  Ordinary API execution, slow uploads, and response bodies can legitimately take
+  longer and have no generic short response-header deadline.
+- `--max-connections` and `--header-read-seconds`: bound accepted HTTP connections
+  (including upgraded tunnels) and expire incomplete inbound request headers.
 
 The sum of subscriber byte allowances is an upper bound on logical queue budget,
 not an exact RSS prediction. Choose subscriber count and byte budgets together.
@@ -94,7 +97,13 @@ and generated clients, an in-memory database, isolated listeners, and temporary
 configuration. It starts no managed service and executes no model calls. Set
 `BUS_PROXY_BINARY` to test a different compiled binary.
 
-The router's release benchmark is in `crates/router/examples/fanout.rs`. It counts
+The router's release benchmark is in `crates/router/examples/routing_bench.rs`:
+
+```sh
+cargo run --release --locked -p bus-proxy-router --example routing_bench -- 128 20000 512
+```
+
+It counts
 received frames and reports selective, broad, and no-follower cases. It measures
 in-process router throughput, not origin CPU savings or network end-to-end latency.
 The real-client compatibility check demonstrates one source connection serving

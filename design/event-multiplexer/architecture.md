@@ -57,7 +57,7 @@ after the basic topology is measured; it adds synchronization obligations.
 | `opencode-bus-proxy` | CLI configuration, tracing subscriber, signal/shutdown composition |
 
 Protocol has no network/runtime requirement. Router depends on protocol and Tokio,
-not HTTP. Gateway composes protocol/router with Hyper/Axum. Daemon is a thin host.
+not HTTP. Gateway composes protocol/router with Hyper. Daemon is a thin host.
 
 ## Concurrency and bounds
 
