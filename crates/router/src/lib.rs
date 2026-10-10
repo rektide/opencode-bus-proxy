@@ -16,6 +16,7 @@ use bytes::Bytes;
 use serde::Serialize;
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
 /// Backlog limits include ready/connected frames. Queue buffers allocate lazily.
 #[derive(Clone, Debug)]
@@ -317,7 +318,11 @@ impl Router {
             sessions: HashMap::new(),
             counters: Counters::default(),
         };
-        let join = tokio::spawn(actor.run(receiver, shutdown));
+        let join = tokio::spawn(
+            actor
+                .run(receiver, shutdown)
+                .instrument(tracing::info_span!("event.router")),
+        );
         Ok((router, join))
     }
 
@@ -388,6 +393,8 @@ struct Subscriber {
     active: bool,
     sessions: HashSet<String>,
     queue: Arc<Queue>,
+    // Retained until removal/reset, not recreated during event admission.
+    span: tracing::Span,
 }
 
 struct Actor {
@@ -444,6 +451,9 @@ impl Actor {
         }
         *lock(&self.epoch_signal) = None;
         for (_, subscriber) in self.subscribers.drain() {
+            subscriber
+                .span
+                .in_scope(|| tracing::debug!("subscription invalidated by source retirement"));
             subscriber.queue.close();
             self.counters.subscriptions_closed =
                 self.counters.subscriptions_closed.saturating_add(1);
@@ -457,7 +467,8 @@ impl Actor {
         let Some(subscriber) = self.subscribers.remove(id) else {
             return;
         };
-        tracing::debug!(subscription_id = id, "removing event subscription");
+        let _entered = subscriber.span.enter();
+        tracing::debug!("removing event subscription");
         subscriber.queue.close();
         self.active.remove(id);
         self.legacy.remove(id);
@@ -542,7 +553,8 @@ impl Actor {
         if self.subscribers.len() >= self.limits.max_subscribers {
             return Err(RouterError::Overloaded);
         }
-        let id = uuid::Uuid::new_v4().to_string();
+        let id = format!("evsub_{}", uuid::Uuid::new_v4().simple());
+        let span = tracing::info_span!("event.subscription", subscription_id = %id, ?mode);
         let queue = Arc::new(Queue::new(&self.limits, epoch_token.clone()));
         queue.offer(match mode {
             Mode::Legacy => connected_frame(),
@@ -563,9 +575,10 @@ impl Actor {
                 active,
                 sessions: HashSet::new(),
                 queue: queue.clone(),
+                span: span.clone(),
             },
         );
-        tracing::debug!(subscription_id = %id, ?mode, "event subscription registered");
+        span.in_scope(|| tracing::debug!("event subscription registered"));
         Ok(Subscription {
             id,
             queue,
@@ -575,6 +588,10 @@ impl Actor {
 
     fn replace(&mut self, id: &str, interest: Interest) -> Result<(), RouterError> {
         let subscriber = self.subscribers.get(id).ok_or(RouterError::NotFound)?;
+        let span = tracing::info_span!(parent: &subscriber.span,
+            "event.subscription.replace", interest_count = interest.sessions.len(),
+            activating = !subscriber.active);
+        let _entered = span.enter();
         if subscriber.queue.is_closed() || subscriber.mode != Mode::Controlled {
             return Err(RouterError::NotFound);
         }
@@ -609,7 +626,7 @@ impl Actor {
         }
         subscriber.active = true;
         self.active.insert(id.to_owned());
-        tracing::debug!(subscription_id = id, "event interest replaced");
+        tracing::debug!("event interest replaced");
         Ok(())
     }
 

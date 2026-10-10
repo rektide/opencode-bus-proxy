@@ -530,3 +530,43 @@ async fn canceling_idle_receive_does_not_lose_later_frame_or_close_subscription(
     );
     fixture.done().await;
 }
+
+#[tokio::test]
+async fn subscription_ids_and_ready_frames_obey_native_evsub_schema() {
+    let fixture = Fixture::new(Limits::default()).await;
+    let mut ids = std::collections::HashSet::new();
+    for mode in [Mode::Controlled, Mode::Legacy] {
+        for _ in 0..32 {
+            let mut subscription = fixture.router.subscribe(mode).await.unwrap();
+            let id = subscription.id().to_owned();
+            let suffix = id
+                .strip_prefix("evsub_")
+                .expect("native subscription ID prefix");
+            assert_eq!(suffix.len(), 32, "native lowercase hex ID length");
+            assert!(
+                suffix
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            );
+            assert!(ids.insert(id.clone()), "IDs must be unique");
+            let frame = recv(&mut subscription).await.unwrap();
+            if mode == Mode::Controlled {
+                let data = frame
+                    .strip_prefix(b"data: ")
+                    .unwrap()
+                    .strip_suffix(b"\n\n")
+                    .unwrap();
+                let ready: serde_json::Value = serde_json::from_slice(data).unwrap();
+                assert_eq!(ready["type"], "event-feed.ready");
+                assert_eq!(ready["data"]["subscriptionID"], id);
+                assert_eq!(
+                    ready["data"]["profiles"],
+                    serde_json::json!(["session-streaming"])
+                );
+            } else {
+                assert_connected(frame);
+            }
+        }
+    }
+    fixture.done().await;
+}
