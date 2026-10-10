@@ -46,6 +46,52 @@ fn normative_scope_fixture_pins_policy_and_cases() {
 }
 
 #[test]
+fn normative_raw_wire_cases_match_metadata_and_preserve_decoded_sse_data() {
+    let fixture: Value =
+        serde_json::from_str(include_str!("../fixtures/event-scope-v1.json")).unwrap();
+    let cases = fixture["wireCases"].as_array().unwrap();
+    assert!(!cases.is_empty());
+    for case in cases {
+        let name = case["name"].as_str().unwrap();
+        let raw = case["json"].as_str().unwrap().as_bytes();
+        let decoded = decode_event(Bytes::copy_from_slice(raw));
+        if case["accept"].as_bool().unwrap() {
+            let UpstreamEvent::Domain { route, event } = decoded.expect(name) else {
+                panic!("{name}: shared raw cases must be domain events")
+            };
+            assert_eq!(
+                route,
+                serde_json::from_value::<Route>(case["expected"].clone()).unwrap(),
+                "{name}"
+            );
+            assert_eq!(event.as_ref(), raw, "{name}: decoder changed event JSON");
+        } else {
+            assert!(
+                decoded.is_err(),
+                "{name}: invalid routing metadata accepted"
+            );
+            assert!(
+                case.get("expected").is_none(),
+                "{name}: rejection has route"
+            );
+        }
+        // Fixture JSON names the decoded SSE data boundary, not arbitrary raw
+        // buffers containing CR/CRLF whitespace. Validate even rejected metadata
+        // so transport round-tripping cannot silently rewrite these raw cases.
+        let frame = event_frame(raw);
+        for size in [1, 7, frame.len()] {
+            assert_eq!(decode_chunks(&frame, size, 8192), [raw], "{name}");
+        }
+        if let Some(sse) = case.get("sse") {
+            let sse = sse.as_str().unwrap().as_bytes();
+            for size in [1, 7, sse.len()] {
+                assert_eq!(decode_chunks(sse, size, 8192), [raw], "{name}: raw SSE");
+            }
+        }
+    }
+}
+
+#[test]
 fn scope_validation_and_native_duplicate_semantics() {
     let escaped = br#"{"\u0074ype":"session.text.delta","\u0073cope":{"session\u0049D":"ses_escaped","locations":[{"\u0064irectory":"","workspace\u0049D":"wrk"}]}}"#;
     assert!(

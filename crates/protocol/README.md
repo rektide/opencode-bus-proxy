@@ -4,8 +4,10 @@
 Call it only on an ordinary `/api/event` connection negotiated with
 `OpenCode-Event-Scope: 1`. It returns `UpstreamEvent::Connected { epoch }` for an
 `evt_`-prefixed connected ID, or `UpstreamEvent::Domain { route, event: Bytes }`.
-The latter retains **all** event JSON bytes, including leading/trailing whitespace,
-scope, unknown properties, numeric lexemes and escapes. Borrowed `RawValue`s are
+The latter retains **all decoded SSE data bytes**, including leading/trailing
+JSON whitespace, scope, unknown properties, numeric lexemes and escapes. This
+preservation promise is at the decoded SSE data boundary, not byte identity for
+arbitrary raw buffers containing literal CR/CRLF whitespace. Borrowed `RawValue`s are
 used only to inspect metadata without decoding arbitrary payloads.
 
 Every domain event requires an object `scope`. Optional `sessionID` and `locations`
@@ -24,7 +26,12 @@ markers are not valid ordinary uplink items. Header negotiation, first-connected
 sequencing, duplicate-connected rejection and uplink failure belong to gateway.
 The vendored `fixtures/event-scope-v1.json` pins capability, classification and
 focused cases; cross-repository compatibility also checks its byte equality with
-native Protocol's fixture.
+native Protocol's fixture. Its `wireCases` retain raw JSON strings so duplicate
+and escaped keys survive fixture loading. Acceptance tests only the routing-
+metadata boundary, **not** the full native event payload schema; `data` is opaque
+and may deliberately be minimal or unfamiliar. Rust checks acceptance, expected
+routes, exact data after `event_frame`/`SseDecoder` round-tripping, and optional
+raw SSE decoding (including CRLF transport into LF multiline JSON data).
 
 `decode_interest` follows native schema permissiveness: directory is any string;
 Session/workspace IDs require only `ses`/`wrk` prefixes. Unknown properties are

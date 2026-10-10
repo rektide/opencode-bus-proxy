@@ -83,5 +83,191 @@
       },
       "expected": { "kind": "broadcast" }
     }
+  ],
+  "wireCases": [
+    {
+      "name": "metadata only: focused text",
+      "json": "{\"type\":\"session.text.delta\",\"scope\":{\"sessionID\":\"ses_text\"},\"data\":{}}",
+      "accept": true,
+      "expected": { "kind": "session", "sessionID": "ses_text" }
+    },
+    {
+      "name": "metadata only: focused reasoning",
+      "json": "{\"type\":\"session.reasoning.delta\",\"scope\":{\"sessionID\":\"ses_reasoning\"},\"data\":{}}",
+      "accept": true,
+      "expected": { "kind": "session", "sessionID": "ses_reasoning" }
+    },
+    {
+      "name": "metadata only: focused tool input",
+      "json": "{\"type\":\"session.tool.input.delta\",\"scope\":{\"sessionID\":\"ses_input\"},\"data\":{}}",
+      "accept": true,
+      "expected": { "kind": "session", "sessionID": "ses_input" }
+    },
+    {
+      "name": "metadata only: focused tool progress",
+      "json": "{\"type\":\"session.tool.progress\",\"scope\":{\"sessionID\":\"ses_progress\"},\"data\":{}}",
+      "accept": true,
+      "expected": { "kind": "session", "sessionID": "ses_progress" }
+    },
+    {
+      "name": "metadata only: focused compaction",
+      "json": "{\"type\":\"session.compaction.delta\",\"scope\":{\"sessionID\":\"ses_compaction\"},\"data\":{}}",
+      "accept": true,
+      "expected": { "kind": "session", "sessionID": "ses_compaction" }
+    },
+    {
+      "name": "duplicate type selects last broad type",
+      "json": "{\"type\":\"session.text.delta\",\"type\":\"future.public\",\"scope\":{\"sessionID\":\"ses_authority\"}}",
+      "accept": true,
+      "expected": { "kind": "broadcast" }
+    },
+    {
+      "name": "duplicate type selects last focused type",
+      "json": "{\"type\":null,\"type\":\"session.text.delta\",\"scope\":{\"sessionID\":\"ses_authority\"}}",
+      "accept": true,
+      "expected": { "kind": "session", "sessionID": "ses_authority" }
+    },
+    {
+      "name": "duplicate type last null rejects",
+      "json": "{\"type\":\"future.public\",\"type\":null,\"scope\":{}}",
+      "accept": false
+    },
+    {
+      "name": "duplicate scope selects last object",
+      "json": "{\"type\":\"session.text.delta\",\"scope\":null,\"scope\":{\"sessionID\":\"ses_last\"}}",
+      "accept": true,
+      "expected": { "kind": "session", "sessionID": "ses_last" }
+    },
+    {
+      "name": "duplicate scope last null rejects",
+      "json": "{\"type\":\"future.public\",\"scope\":{},\"scope\":null}",
+      "accept": false
+    },
+    {
+      "name": "duplicate Session selects last brand",
+      "json": "{\"type\":\"session.text.delta\",\"scope\":{\"sessionID\":null,\"sessionID\":\"ses_last\"}}",
+      "accept": true,
+      "expected": { "kind": "session", "sessionID": "ses_last" }
+    },
+    {
+      "name": "duplicate Session last null rejects",
+      "json": "{\"type\":\"future.public\",\"scope\":{\"sessionID\":\"ses_first\",\"sessionID\":null}}",
+      "accept": false
+    },
+    {
+      "name": "duplicate locations and Location fields select last values",
+      "json": "{\"type\":\"future.public\",\"scope\":{\"locations\":null,\"locations\":[{\"directory\":null,\"directory\":\"relative\",\"workspaceID\":null,\"workspaceID\":\"wrk_last\"}]}}",
+      "accept": true,
+      "expected": { "kind": "broadcast" }
+    },
+    {
+      "name": "duplicate Location directory last null rejects",
+      "json": "{\"type\":\"future.public\",\"scope\":{\"locations\":[{\"directory\":\"first\",\"directory\":null}]}}",
+      "accept": false
+    },
+    {
+      "name": "escaped duplicate recognized keys select last decoded names",
+      "json": "{\"type\":null,\"\\u0074ype\":\"session.tool.progress\",\"scope\":null,\"\\u0073cope\":{\"sessionID\":null,\"session\\u0049D\":\"ses_escaped\",\"locations\":null,\"locat\\u0069ons\":[{\"directory\":null,\"\\u0064irectory\":\"\",\"workspaceID\":null,\"workspace\\u0049D\":\"wrk\"}]}}",
+      "accept": true,
+      "expected": { "kind": "session", "sessionID": "ses_escaped" }
+    },
+    {
+      "name": "escaped duplicate workspace last null rejects",
+      "json": "{\"type\":\"future.public\",\"scope\":{\"locations\":[{\"directory\":\"\",\"workspaceID\":\"wrk\",\"workspace\\u0049D\":null}]}}",
+      "accept": false
+    },
+    {
+      "name": "omitted scope rejects older unextended event",
+      "json": "{\"type\":\"future.public\",\"data\":{}}",
+      "accept": false
+    },
+    {
+      "name": "null scope rejects",
+      "json": "{\"type\":\"future.public\",\"scope\":null}",
+      "accept": false
+    },
+    {
+      "name": "array scope rejects",
+      "json": "{\"type\":\"future.public\",\"scope\":[]}",
+      "accept": false
+    },
+    {
+      "name": "omitted Session never falls back to opaque payload",
+      "json": "{\"type\":\"session.text.delta\",\"scope\":{},\"data\":{\"sessionID\":\"ses_spoof\"}}",
+      "accept": true,
+      "expected": { "kind": "session" }
+    },
+    {
+      "name": "null optional Session rejects even for broad type",
+      "json": "{\"type\":\"future.public\",\"scope\":{\"sessionID\":null}}",
+      "accept": false
+    },
+    {
+      "name": "invalid Session brand rejects",
+      "json": "{\"type\":\"session.text.delta\",\"scope\":{\"sessionID\":\"wrong\"}}",
+      "accept": false
+    },
+    {
+      "name": "global scope omits locations",
+      "json": "{\"type\":\"future.public\",\"scope\":{}}",
+      "accept": true,
+      "expected": { "kind": "broadcast" }
+    },
+    {
+      "name": "explicit empty location audience remains present",
+      "json": "{\"type\":\"future.public\",\"scope\":{\"locations\":[]}}",
+      "accept": true,
+      "expected": { "kind": "broadcast" }
+    },
+    {
+      "name": "multiple locations preserve workspace and permissive directory brands",
+      "json": "{\"type\":\"session.reasoning.delta\",\"scope\":{\"sessionID\":\"ses\",\"locations\":[{\"directory\":\"\",\"workspaceID\":\"wrk\"},{\"directory\":\"relative/path\"},{\"directory\":\"/work/app\",\"workspaceID\":\"wrk_other\"}]},\"location\":{\"directory\":\"/singular\"}}",
+      "accept": true,
+      "expected": { "kind": "session", "sessionID": "ses" }
+    },
+    {
+      "name": "null optional locations rejects",
+      "json": "{\"type\":\"future.public\",\"scope\":{\"locations\":null}}",
+      "accept": false
+    },
+    {
+      "name": "null Location entry rejects",
+      "json": "{\"type\":\"future.public\",\"scope\":{\"locations\":[null]}}",
+      "accept": false
+    },
+    {
+      "name": "missing Location directory rejects",
+      "json": "{\"type\":\"future.public\",\"scope\":{\"locations\":[{\"workspaceID\":\"wrk\"}]}}",
+      "accept": false
+    },
+    {
+      "name": "null optional workspace rejects",
+      "json": "{\"type\":\"future.public\",\"scope\":{\"locations\":[{\"directory\":\"\",\"workspaceID\":null}]}}",
+      "accept": false
+    },
+    {
+      "name": "invalid workspace brand rejects",
+      "json": "{\"type\":\"future.public\",\"scope\":{\"locations\":[{\"directory\":\"\",\"workspaceID\":\"wrong\"}]}}",
+      "accept": false
+    },
+    {
+      "name": "unknown extensions and future payload stay opaque without re-encoding",
+      "json": "  { \"type\":\"future.public\", \"scope\":{\"future\":{\"number\":1e400},\"locations\":[{\"directory\":\"relative\",\"extension\":null}]}, \"data\":[null,{\"sessionID\":\"ses_spoof\"}], \"number\":900719925474099312345, \"float\":1.2300e+03, \"escaped\":\"\\u0061\" }  ",
+      "accept": true,
+      "expected": { "kind": "broadcast" }
+    },
+    {
+      "name": "Session lifecycle stays broad despite authoritative Session scope",
+      "json": "{\"type\":\"session.renamed\",\"scope\":{\"sessionID\":\"ses_authority\"},\"data\":{}}",
+      "accept": true,
+      "expected": { "kind": "broadcast" }
+    },
+    {
+      "name": "multiline decoded JSON preserves LF data across CRLF SSE transport",
+      "json": "{\n  \"type\": \"future.public\",\n  \"scope\": {\"locations\": []},\n  \"data\": {\"escaped\": \"\\n\", \"number\": 1.2300e+03}\n}",
+      "accept": true,
+      "expected": { "kind": "broadcast" },
+      "sse": ": transport comment\r\n\r\ndata: {\r\ndata:   \"type\": \"future.public\",\r\ndata:   \"scope\": {\"locations\": []},\r\ndata:   \"data\": {\"escaped\": \"\\n\", \"number\": 1.2300e+03}\r\ndata: }\r\n\r\n"
+    }
   ]
 }
