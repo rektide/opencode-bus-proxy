@@ -4,6 +4,11 @@ A standalone Rust gateway that moves OpenCode event selection and fan-out out of
 the Session execution server. Tokio async I/O, an indexed single-owner router,
 shared frame bytes, bounded subscriber queues, and structured `tracing`.
 
+The complete system's [canonical architecture](../opencode-bus-smart/doc/bus-smart/architecture.md)
+and [development handoff](../opencode-bus-smart/doc/bus-smart/handoff.md) live in
+bus-smart. This repository maintains the optional gateway implementation and its
+operating instructions; bus-smart also works directly without the gateway.
+
 - **Unchanged OpenCode V2 clients:** `/api/event` broadcasts public events.
 - **Bus-smart clients:** existing controlled GET/interest PUT selects streaming
   events by Session, while other public events remain broad.

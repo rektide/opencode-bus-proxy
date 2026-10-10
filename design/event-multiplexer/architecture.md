@@ -1,5 +1,9 @@
 # Rust subscription-aware gateway
 
+Gateway-focused design reference. The maintained whole-system account is
+[Bus-smart event delivery](../../../opencode-bus-smart/doc/bus-smart/architecture.md);
+current improvement fronts live in its [handoff](../../../opencode-bus-smart/doc/bus-smart/handoff.md).
+
 ## Decision
 
 Build a standalone, same-origin gateway in `opencode-bus-proxy`, with authoritative
@@ -52,12 +56,12 @@ after the basic topology is measured; it adds synchronization obligations.
 
 ## Crate boundaries
 
-| Crate | Responsibility |
-| --- | --- |
-| `bus-proxy-protocol` | Scoped ordinary events, selection contract, bounded SSE decoding, interest validation and native handshake framing |
-| `bus-proxy-router` | Subscription lifetime, indexed admission, complete replacement, bounded queues, epoch invalidation, inspectable state/counters |
-| `bus-proxy-gateway` | Upstream connection/retry, authentication integration, SSE endpoints, streaming HTTP and WebSocket proxying, health/metrics |
-| `opencode-bus-proxy` | CLI configuration, tracing subscriber, signal/shutdown composition |
+| Crate                | Responsibility                                                                                                                 |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| `bus-proxy-protocol` | Scoped ordinary events, selection contract, bounded SSE decoding, interest validation and native handshake framing             |
+| `bus-proxy-router`   | Subscription lifetime, indexed admission, complete replacement, bounded queues, epoch invalidation, inspectable state/counters |
+| `bus-proxy-gateway`  | Upstream connection/retry, authentication integration, SSE endpoints, streaming HTTP and WebSocket proxying, health/metrics    |
+| `opencode-bus-proxy` | CLI configuration, tracing subscriber, signal/shutdown composition                                                             |
 
 Protocol has no network/runtime requirement. Router depends on protocol and Tokio,
 not HTTP. Gateway composes protocol/router with Hyper. Daemon is a thin host.

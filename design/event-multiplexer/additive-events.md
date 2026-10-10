@@ -1,5 +1,11 @@
 # Additive scoped events on the ordinary OpenCode stream
 
+Implementation decision record. The maintained present-state architecture and
+further-work handoff are owned by bus-smart:
+[architecture](../../../opencode-bus-smart/doc/bus-smart/architecture.md) and
+[handoff](../../../opencode-bus-smart/doc/bus-smart/handoff.md). Protocol code and
+the versioned fixture are the executable wire contract.
+
 ## Decision and motivation
 
 Use **ordinary `GET /api/event`** for the proxy's single upstream connection.
