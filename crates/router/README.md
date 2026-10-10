@@ -10,6 +10,9 @@ Begin a nonempty unique epoch, subscribe legacy or controlled streams, replace
 controlled interests, and publish one source frame at a time awaiting each ack.
 `Interest` must already obey protocol validation; publication sizes are bounded
 by the source decoder. No socket, HTTP, native payload parsing, or replay is here.
+`Route` is now an internal decision made by protocol from a negotiated ordinary
+event's authoritative scope and the frozen session-streaming type list; it is not
+an upstream wire envelope. The actor/index/queue API is otherwise unchanged.
 
 ## Guarantees and overload
 
@@ -76,9 +79,9 @@ network snapshot. Snapshot reaps dead subscriptions before reporting.
 ## Verification
 
 ```sh
-cargo test -p bus-proxy-router
-cargo clippy -p bus-proxy-router --all-targets -- -D warnings
-cargo run --release -p bus-proxy-router --example routing_bench -- 128 20000 512
+cargo +1.98.0 test -p bus-proxy-router
+cargo +1.98.0 clippy -p bus-proxy-router --all-targets -- -D warnings
+cargo +1.98.0 run --release -p bus-proxy-router --example routing_bench -- 128 20000 512
 ```
 
 Benchmark arguments: clients, events, delta payload bytes. Four Tokio workers;

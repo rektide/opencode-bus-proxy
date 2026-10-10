@@ -1,11 +1,30 @@
 # Protocol boundary
 
-`decode_source` implements `design/event-multiplexer/source-contract.md`'s top-level
-envelope. It retains native event JSON as `RawValue`, validates only that event is
-an object, and never derives routing from payload fields. Future broad types and
-unfamiliar event properties survive unchanged. Version support, epoch readiness,
-duplicate-ready handling and uplink failure belong to gateway; routing and public
-classification belong to origin.
+`decode_event(Bytes)` implements [additive scoped events](../../design/event-multiplexer/additive-events.md).
+Call it only on an ordinary `/api/event` connection negotiated with
+`OpenCode-Event-Scope: 1`. It returns `UpstreamEvent::Connected { epoch }` for an
+`evt_`-prefixed connected ID, or `UpstreamEvent::Domain { route, event: Bytes }`.
+The latter retains **all** event JSON bytes, including leading/trailing whitespace,
+scope, unknown properties, numeric lexemes and escapes. Borrowed `RawValue`s are
+used only to inspect metadata without decoding arbitrary payloads.
+
+Every domain event requires an object `scope`. Optional `sessionID` and `locations`
+are absent rather than null; Session/workspace IDs use native `ses`/`wrk` prefixes,
+and directory is any string. Global absent locations and explicit empty/multiple
+Location lists remain distinct in forwarded bytes. Unknown extension fields are
+allowed, including deeply nested values and out-of-range JSON numbers. Recognized
+duplicate keys follow native JSON.parse last-value-wins semantics, including
+escaped property names. Payload `data.sessionID` never establishes authority.
+
+`STREAMING_TYPES` freezes the existing five session-streaming types. Their internal
+`Route::Session` uses only `scope.sessionID`; absent identity reaches legacy
+listeners only. All other event types, including future types, are broad.
+`Route` is a local admission decision, not an exported envelope. Controlled ready
+markers are not valid ordinary uplink items. Header negotiation, first-connected
+sequencing, duplicate-connected rejection and uplink failure belong to gateway.
+The vendored `fixtures/event-scope-v1.json` pins capability, classification and
+focused cases; cross-repository compatibility also checks its byte equality with
+native Protocol's fixture.
 
 `decode_interest` follows native schema permissiveness: directory is any string;
 Session/workspace IDs require only `ses`/`wrk` prefixes. Unknown properties are
@@ -30,13 +49,14 @@ an error; final comments and clean EOF are accepted. Invalid UTF-8 errors rather
 than silently inserting replacement characters. Finish/error closes the decoder;
 a reconnect must construct a fresh one.
 
-`event_frame` preserves raw native JSON except normalization of literal pretty-print
+`event_frame(&[u8])` preserves raw native JSON except normalization of literal pretty-print
 CR/CRLF whitespace to LF, required by SSE's newline semantics. Escape sequences,
 number lexemes, indentation, property order and other raw contents are unchanged.
 Every physical JSON line gets its own `data: ` prefix. `ready_frame` advertises
 only session-streaming; `connected_frame` emits only native id/type/data fields.
 
-Constants exported: `EVENT_PATH`, `CONTROLLED_EVENT_PATH`, `SOURCE_PATH`,
+Constants exported: `EVENT_PATH`, `CONTROLLED_EVENT_PATH`, `EVENT_SCOPE_HEADER`,
+`EVENT_SCOPE_VERSION`, `STREAMING_TYPES`,
 `INTEREST_PATH_PREFIX`, `INTEREST_PATH_SUFFIX`, `INTEREST_BYTE_CAPACITY`,
 `LOCATION_INTEREST_CAPACITY`, `SESSION_INTEREST_CAPACITY`,
 `DEFAULT_MAX_SOURCE_FRAME_BYTES`.
@@ -44,7 +64,7 @@ Constants exported: `EVENT_PATH`, `CONTROLLED_EVENT_PATH`, `SOURCE_PATH`,
 Checks (workspace root):
 
 ```sh
-cargo test -p bus-proxy-protocol
-cargo clippy -p bus-proxy-protocol --all-targets -- -D warnings
-cargo fmt -p bus-proxy-protocol
+cargo +1.98.0 test -p bus-proxy-protocol
+cargo +1.98.0 clippy -p bus-proxy-protocol --all-targets -- -D warnings
+cargo +1.98.0 fmt -p bus-proxy-protocol --check
 ```
