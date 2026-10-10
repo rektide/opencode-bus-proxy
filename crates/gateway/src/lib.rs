@@ -386,9 +386,9 @@ async fn handle(mut request: Request<Incoming>, state: Arc<State>) -> Response<B
         let read = async {
             let mut data = Vec::new();
             while let Some(frame) = request.body_mut().frame().await {
-                if let Ok(bytes) = frame.map_err(|_| ())?.into_data() {
+                if let Ok(bytes) = frame.map_err(|_| false)?.into_data() {
                     if data.len().saturating_add(bytes.len()) > INTEREST_BYTES {
-                        return Err(());
+                        return Err(true);
                     }
                     data.extend_from_slice(&bytes);
                 }
@@ -396,6 +396,10 @@ async fn handle(mut request: Request<Incoming>, state: Arc<State>) -> Response<B
             Ok(data)
         };
         match tokio::time::timeout(state.config.request_timeout, read).await {
+            Ok(Err(true)) => json(
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({"_tag":"InvalidRequestError","message":format!("Interest exceeds {INTEREST_BYTES} request bytes"),"field":"interest"}),
+            ),
             Ok(Ok(data)) => match bus_proxy_protocol::decode_interest(&data) {
                 Ok(interest) => match state.router.replace(id.clone(), interest).await {
                     Ok(()) => Response::builder()
@@ -571,6 +575,7 @@ async fn forward(mut request: Request<Incoming>, state: Arc<State>) -> Response<
             .flat_map(|v| v.split(','))
             .any(|v| v.trim().eq_ignore_ascii_case("upgrade"));
     let downstream = upgrade.then(|| hyper::upgrade::on(&mut request));
+    let requested_protocol = request.headers().get(header::UPGRADE).cloned();
     let uri: Uri = match format!(
         "{}{}",
         state.base,
@@ -603,7 +608,24 @@ async fn forward(mut request: Request<Incoming>, state: Arc<State>) -> Response<
         let Some(downstream) = downstream else {
             return failure(StatusCode::BAD_GATEWAY, "Unexpected upstream upgrade");
         };
-        if !response.headers().contains_key(header::UPGRADE) {
+        let valid_protocol = response
+            .headers()
+            .get(header::UPGRADE)
+            .and_then(|v| v.to_str().ok())
+            .zip(requested_protocol.as_ref().and_then(|v| v.to_str().ok()))
+            .is_some_and(|(actual, requested)| {
+                requested
+                    .split(',')
+                    .any(|v| v.trim().eq_ignore_ascii_case(actual.trim()))
+            });
+        let valid_connection = response
+            .headers()
+            .get_all(header::CONNECTION)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|v| v.split(','))
+            .any(|v| v.trim().eq_ignore_ascii_case("upgrade"));
+        if !valid_protocol || !valid_connection {
             return failure(StatusCode::BAD_GATEWAY, "Invalid upstream upgrade");
         }
         let upstream = hyper::upgrade::on(&mut response);

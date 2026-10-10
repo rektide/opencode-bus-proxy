@@ -126,6 +126,7 @@ impl Harness {
             upstream,
             password: Some("secret".into()),
             source_idle_timeout: Duration::from_secs(2),
+            max_source_frame_bytes: 1024,
             ..Config::default()
         };
         let gateway = tokio::spawn(serve(listener, config, router_handle, stop.clone()));
@@ -387,19 +388,17 @@ async fn streaming_forwarding_cookie_auth_cors_and_raw_upgrade() {
     );
     let query = harness
         .client
-        .request(
-            harness.request(
-                "GET",
-                &format!(
+        .request(harness.request(
+            "GET",
+            &format!(
                     "/_bus/health?auth_token={}",
                     url::form_urlencoded::byte_serialize(
                         STANDARD.encode("opencode:secret").as_bytes()
                     )
                     .collect::<String>()
                 ),
-                full(Bytes::new()),
-            ),
-        )
+            full(Bytes::new()),
+        ))
         .await
         .unwrap();
     assert_eq!(query.status(), 200);
@@ -471,6 +470,18 @@ async fn invalid_source_and_idle_timeout_end_downstream() {
         .await
         .unwrap();
     assert!(feed.next().await.is_none());
+    let _source = harness.sources.recv().await.unwrap();
+    harness.ready().await;
+    let mut feed = harness.feed(false).await;
+    feed.next().await.unwrap();
+    _source
+        .send(Bytes::from(format!("data: {}\n\n", "x".repeat(2048))))
+        .await
+        .unwrap();
+    assert!(
+        feed.next().await.is_none(),
+        "oversized source frame must retire the epoch"
+    );
     let _source = harness.sources.recv().await.unwrap();
     harness.ready().await;
     let mut feed = harness.feed(false).await;

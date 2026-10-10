@@ -56,15 +56,11 @@ pub(crate) fn authorized<B>(request: &Request<B>, config: &Config) -> bool {
         .or(basic)
         .and_then(|v| STANDARD.decode(v).ok())
         .and_then(|v| String::from_utf8(v).ok())
+        && let Some((user, secret)) = decoded.split_once(':')
+        && user == config.username
+        && (bool::from(secret.as_bytes().ct_eq(password.as_bytes())) || session(secret, password))
     {
-        if let Some((user, secret)) = decoded.split_once(':') {
-            if user == config.username
-                && (bool::from(secret.as_bytes().ct_eq(password.as_bytes()))
-                    || session(secret, password))
-            {
-                return true;
-            }
-        }
+        return true;
     }
     let host = request
         .headers()
@@ -122,4 +118,72 @@ pub(crate) fn cors_allowed(origin: &str, config: &Config) -> bool {
                 && v.bytes()
                     .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn credential_precedence_and_native_challenge_boundary() {
+        let config = Config {
+            password: Some("secret".into()),
+            ..Config::default()
+        };
+        let valid = format!("Basic {}", STANDARD.encode("opencode:secret"));
+        let request = Request::builder()
+            .uri("/api/event?auth_token=invalid")
+            .header("authorization", &valid)
+            .body(())
+            .unwrap();
+        assert!(
+            !authorized(&request, &config),
+            "query credentials take precedence"
+        );
+        let request = Request::builder()
+            .uri("/api/event")
+            .header("authorization", &valid)
+            .body(())
+            .unwrap();
+        assert!(authorized(&request, &config));
+        let request = Request::builder()
+            .uri("/api/event")
+            .header(
+                "authorization",
+                format!("Basic {}", STANDARD.encode("other:secret")),
+            )
+            .body(())
+            .unwrap();
+        assert!(!authorized(&request, &config));
+        assert!(!session("0.expired", "secret"));
+        assert!(!session("4102444800.forged", "secret"));
+    }
+    #[test]
+    fn native_default_cors_and_exact_configured_origins() {
+        let config = Config {
+            cors: vec!["https://custom.test".into()],
+            ..Config::default()
+        };
+        for origin in [
+            "http://localhost:1",
+            "http://127.0.0.1:2",
+            "oc://renderer",
+            "tauri://localhost",
+            "http://tauri.localhost",
+            "https://tauri.localhost",
+            "https://opencode.ai",
+            "https://a-b.opencode.ai",
+            "https://custom.test",
+        ] {
+            assert!(cors_allowed(origin, &config), "{origin}");
+        }
+        for origin in [
+            "https://opencode.ai.evil.test",
+            "https://OPENCODE.ai",
+            "https://opencode.ai/",
+            "http://opencode.ai",
+            "https://evil.test",
+        ] {
+            assert!(!cors_allowed(origin, &config), "{origin}");
+        }
+    }
 }
