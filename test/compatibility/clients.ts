@@ -30,6 +30,8 @@ import {
   EventFeedReady,
   EventSubscriptionNotFoundError,
   ControlledFeedItem,
+  EventScope,
+  isStreamingEvent,
 } from "../../../opencode-bus-smart/packages/protocol/src/groups/event"
 
 const root = resolve(import.meta.dir, "../..")
@@ -43,6 +45,23 @@ assert.equal(
   "native and Rust delivery fixtures must be byte-identical",
 )
 const contract = JSON.parse(contractText)
+assert.equal(contract.profile, "session-streaming")
+assert.ok(contract.wireCases.length > 0, "shared contract must exercise raw JSON metadata")
+for (const fixture of [
+  ...contract.cases.map((item) => ({ ...item, json: JSON.stringify(item.event), accept: true })),
+  ...contract.wireCases,
+]) {
+  const decodeMetadata = () => {
+    const event = JSON.parse(fixture.json)
+    const type = Schema.decodeUnknownSync(Schema.String)(event.type)
+    const scope = Schema.decodeUnknownSync(EventScope)(event.scope)
+    return isStreamingEvent({ type })
+      ? { kind: "session", ...(scope.sessionID === undefined ? {} : { sessionID: scope.sessionID }) }
+      : { kind: "broadcast" }
+  }
+  if (fixture.accept) assert.deepEqual(decodeMetadata(), fixture.expected, fixture.name)
+  else assert.throws(decodeMetadata, undefined, fixture.name)
+}
 const password = crypto.randomUUID()
 const headers = {
   authorization: `Basic ${Buffer.from(`opencode:${password}`).toString("base64")}`,
@@ -140,6 +159,13 @@ try {
                 response.ok
               ) {
                 assert.equal(response.headers.get(contract.capability.header), contract.capability.value)
+                assert.ok(
+                  response.headers
+                    .get("access-control-expose-headers")
+                    ?.split(",")
+                    .some((header) => header.trim().toLowerCase() === contract.capability.header.toLowerCase()),
+                  "scope capability must be inspectable by browser clients too",
+                )
               }
               return response
             },
