@@ -13,7 +13,7 @@ use hyper::{
 };
 use hyper_util::{
     client::legacy::{Client, connect::HttpConnector},
-    rt::{TokioExecutor, TokioIo},
+    rt::{TokioExecutor, TokioIo, TokioTimer},
 };
 use std::{
     convert::Infallible,
@@ -23,7 +23,11 @@ use std::{
     },
     time::Duration,
 };
-use tokio::{net::TcpListener, task::JoinSet};
+use tokio::{
+    net::TcpListener,
+    sync::{OwnedSemaphorePermit, Semaphore},
+    task::JoinSet,
+};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -41,7 +45,12 @@ pub struct Config {
     pub cors: Vec<String>,
     pub max_source_frame_bytes: usize,
     pub source_idle_timeout: Duration,
+    /// Upstream TCP connect and source/upgrade setup deadline, not an ordinary operation deadline.
     pub request_timeout: Duration,
+    /// Maximum admitted downstream HTTP connections, including upgraded tunnels.
+    pub max_connections: usize,
+    /// Deadline for receiving each HTTP/1 request's headers; bodies are not timed out.
+    pub header_read_timeout: Duration,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -53,6 +62,8 @@ impl Default for Config {
             max_source_frame_bytes: 16 * 1024 * 1024,
             source_idle_timeout: Duration::from_secs(45),
             request_timeout: Duration::from_secs(10),
+            max_connections: 1024,
+            header_read_timeout: Duration::from_secs(10),
         }
     }
 }
@@ -120,6 +131,9 @@ pub async fn serve(
     if config.max_source_frame_bytes == 0
         || config.source_idle_timeout.is_zero()
         || config.request_timeout.is_zero()
+        || config.max_connections == 0
+        || config.max_connections > Semaphore::MAX_PERMITS
+        || config.header_read_timeout.is_zero()
     {
         return Err(GatewayError::Configuration("limits must be positive"));
     }
@@ -144,22 +158,32 @@ pub async fn serve(
     });
     let mut source = tokio::spawn(source_owner(state.clone()));
     let mut connections = JoinSet::new();
+    let permits = Arc::new(Semaphore::new(state.config.max_connections));
     let result = loop {
         tokio::select! {
             biased;
             _ = shutdown.cancelled() => break Ok(()),
             result = &mut source => break result.map_err(GatewayError::SourceTask),
             Some(_) = connections.join_next(), if !connections.is_empty() => {},
-            accepted = listener.accept() => {
-                let (socket, _) = match accepted { Ok(v) => v, Err(e) => break Err(GatewayError::Listener(e)) };
+            accepted = async {
+                let permit = permits.clone().acquire_owned().await.expect("connection semaphore stays open");
+                listener.accept().await.map(|(socket, _)| (socket, Arc::new(permit)))
+            } => {
+                let (socket, permit) = match accepted { Ok(v) => v, Err(e) => break Err(GatewayError::Listener(e)) };
                 let state = state.clone();
                 connections.spawn(async move {
                     let service_state = state.clone();
-                    let service = service_fn(move |request| {
+                    let service_permit = permit.clone();
+                    let service = service_fn(move |mut request: Request<Incoming>| {
+                        // The upgrade task takes this lease before Hyper releases its
+                        // connection driver, so tunnels share the same admission cap.
+                        request.extensions_mut().insert(service_permit.clone());
                         let state = service_state.clone();
                         async move { Ok::<_, Infallible>(handle(request, state).await) }
                     });
-                    let connection = hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(socket), service).with_upgrades();
+                    let connection = hyper::server::conn::http1::Builder::new()
+                        .timer(TokioTimer::new()).header_read_timeout(state.config.header_read_timeout)
+                        .serve_connection(TokioIo::new(socket), service).with_upgrades();
                     tokio::pin!(connection);
                     tokio::select! {
                         _ = state.shutdown.cancelled() => { connection.as_mut().graceful_shutdown(); let _ = connection.await; },
@@ -566,6 +590,9 @@ fn strip_hop(headers: &mut HeaderMap, upgrade: bool) {
     }
 }
 async fn forward(mut request: Request<Incoming>, state: Arc<State>) -> Response<Body> {
+    let connection_permit = request
+        .extensions_mut()
+        .remove::<Arc<OwnedSemaphorePermit>>();
     if request.method() == Method::CONNECT {
         return failure(StatusCode::METHOD_NOT_ALLOWED, "CONNECT is unsupported");
     }
@@ -643,6 +670,7 @@ async fn forward(mut request: Request<Incoming>, state: Arc<State>) -> Response<
         let stop = state.shutdown.clone();
         let timeout = state.config.request_timeout;
         state.tasks.spawn(async move {
+            let _connection_permit = connection_permit;
             let transfer = async {
                 let (down, up) =
                     tokio::time::timeout(timeout, async { tokio::try_join!(downstream, upstream) })

@@ -27,6 +27,30 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
+
+#[tokio::test]
+async fn connection_limits_must_be_positive() {
+    for config in [
+        Config {
+            max_connections: 0,
+            ..Config::default()
+        },
+        Config {
+            header_read_timeout: Duration::ZERO,
+            ..Config::default()
+        },
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stop = CancellationToken::new();
+        let (router, task) = Router::spawn(Limits::default(), stop.clone()).unwrap();
+        assert!(matches!(
+            serve(listener, config, router, stop.clone()).await,
+            Err(bus_proxy_gateway::GatewayError::Configuration(_))
+        ));
+        stop.cancel();
+        task.await.unwrap();
+    }
+}
 type Body = UnsyncBoxBody<Bytes, Error>;
 fn full(value: impl Into<Bytes>) -> Body {
     Full::new(value.into())
@@ -109,7 +133,10 @@ impl Harness {
                                             let upgrade = hyper::upgrade::on(&mut request);
                                             tokio::spawn(async move {
                                                 let mut io = TokioIo::new(upgrade.await.unwrap());
-                                                let mut data = [0; 4]; io.read_exact(&mut data).await.unwrap(); io.write_all(&data).await.unwrap();
+                                                let mut data = [0; 512];
+                                                while let Ok(size) = io.read(&mut data).await {
+                                                    if size == 0 || io.write_all(&data[..size]).await.is_err() { break; }
+                                                }
                                             });
                                             Response::builder().status(101).header("connection", "upgrade").header("upgrade", "echo").body(full(Bytes::new())).unwrap()
                                         },
@@ -221,6 +248,7 @@ impl Harness {
 async fn ordinary_operations_outlive_setup_timeout_but_remain_cancelable() {
     let mut harness = Harness::with_config(Config {
         request_timeout: Duration::from_millis(100),
+        header_read_timeout: Duration::from_millis(100),
         ..Config::default()
     })
     .await;
@@ -289,6 +317,79 @@ async fn ordinary_operations_outlive_setup_timeout_but_remain_cancelable() {
         .await
         .unwrap()
         .unwrap();
+}
+
+#[tokio::test]
+async fn idle_headers_and_upgrade_tunnels_share_connection_budget() {
+    let mut harness = Harness::with_config(Config {
+        max_connections: 1,
+        header_read_timeout: Duration::from_millis(200),
+        ..Config::default()
+    })
+    .await;
+    let _source = harness.sources.recv().await.unwrap();
+    let address = harness.base.strip_prefix("http://").unwrap();
+    let mut idle = TcpStream::connect(address).await.unwrap();
+    idle.write_all(b"GET /delayed HTTP/1.1\r\n").await.unwrap();
+    let mut next = TcpStream::connect(address).await.unwrap();
+    next.write_all(
+        format!("GET /delayed HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n").as_bytes(),
+    )
+    .await
+    .unwrap();
+    let mut buf = [0; 1024];
+    assert!(
+        tokio::time::timeout(Duration::from_millis(75), next.read(&mut buf))
+            .await
+            .is_err(),
+        "cap must block the second socket while first headers are pending"
+    );
+    let mut idle_reply = Vec::new();
+    tokio::time::timeout(Duration::from_secs(2), idle.read_to_end(&mut idle_reply))
+        .await
+        .unwrap()
+        .unwrap();
+    let size = tokio::time::timeout(Duration::from_secs(2), next.read(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(buf[..size].starts_with(b"HTTP/1.1 200"));
+    drop(next);
+    drop(idle);
+
+    let mut tunnel = TcpStream::connect(address).await.unwrap();
+    tunnel.write_all(format!("GET /upgrade HTTP/1.1\r\nHost: {address}\r\nConnection: upgrade\r\nUpgrade: echo\r\n\r\nping").as_bytes()).await.unwrap();
+    let mut received = Vec::new();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !received.ends_with(b"ping") {
+            let size = tunnel.read(&mut buf).await.unwrap();
+            assert!(size > 0);
+            received.extend_from_slice(&buf[..size]);
+        }
+    })
+    .await
+    .unwrap();
+    assert!(received.starts_with(b"HTTP/1.1 101"));
+    let mut next = TcpStream::connect(address).await.unwrap();
+    next.write_all(
+        format!("GET /delayed HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n").as_bytes(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(275), next.read(&mut buf))
+            .await
+            .is_err(),
+        "upgrade lease must remain held beyond the header deadline"
+    );
+    drop(tunnel);
+    let size = tokio::time::timeout(Duration::from_secs(2), next.read(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(buf[..size].starts_with(b"HTTP/1.1 200"));
+    drop(next);
+    harness.close().await;
 }
 struct Feed {
     body: Incoming,
