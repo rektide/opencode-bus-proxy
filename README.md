@@ -78,5 +78,6 @@ dependencies. It creates an isolated in-memory origin and exercises its real Bus
 HTTP routes, and client code against the compiled proxy.
 
 See [operations](doc/event-multiplexer/operations.md),
+[verification and measured results](doc/event-multiplexer/verification.md),
 [architecture](design/event-multiplexer/architecture.md), and the
 [source contract](design/event-multiplexer/source-contract.md).

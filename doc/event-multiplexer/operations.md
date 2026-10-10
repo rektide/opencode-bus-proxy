@@ -77,7 +77,8 @@ tunnels. The host grants tasks a bounded shutdown grace before aborting straggle
 
 `RUST_LOG` controls `tracing` filtering; `--log-json` emits JSON. Default lifecycle
 logs cover source epochs/retries, gateway startup/shutdown and subscription
-failures. Debug tracing adds request/control information without bodies, credentials,
+failures. Source disconnects include a fixed `reason` category; rejected source HTTP
+responses include their status code. Debug tracing adds request/control information without bodies, credentials,
 or query strings. There is no per-recipient tracing span in the token hot path.
 
 The protected `/_bus/subscriptions` snapshot is the answer to “who is listening
