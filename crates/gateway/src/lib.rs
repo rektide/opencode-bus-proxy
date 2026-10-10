@@ -509,6 +509,7 @@ async fn handle(mut request: Request<Incoming>, state: Arc<State>) -> Response<B
                 Response::builder()
                     .header(header::CONTENT_TYPE, "text/event-stream")
                     .header(EVENT_SCOPE_HEADER, EVENT_SCOPE_VERSION)
+                    .header(header::ACCESS_CONTROL_EXPOSE_HEADERS, EVENT_SCOPE_HEADER)
                     .header(header::CACHE_CONTROL, "no-cache, no-transform")
                     .header("x-accel-buffering", "no")
                     .header("x-content-type-options", "nosniff")

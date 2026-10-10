@@ -325,6 +325,10 @@ impl Harness {
         assert_eq!(response.status(), 200);
         assert_eq!(response.headers()["x-accel-buffering"], "no");
         assert_eq!(response.headers()["OpenCode-Event-Scope"], "1");
+        assert_eq!(
+            response.headers()["access-control-expose-headers"],
+            "OpenCode-Event-Scope"
+        );
         Feed {
             body: response.into_body(),
             decoder: SseDecoder::new(1024 * 1024),
