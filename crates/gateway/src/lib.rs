@@ -303,9 +303,15 @@ fn control_id(path: &str) -> Option<&str> {
         .strip_suffix("/interests")
         .filter(|id| !id.is_empty() && !id.contains('/'))
 }
+fn is_source_path(path: &str) -> bool {
+    // Refuse aliases an upstream URL/router could normalize to the private export.
+    let decoded = percent_encoding::percent_decode_str(path).decode_utf8_lossy();
+    url::Url::parse(&format!("http://local{decoded}")).is_ok_and(|url| url.path() == SOURCE)
+}
 async fn handle(mut request: Request<Incoming>, state: Arc<State>) -> Response<Body> {
     let path = request.uri().path();
-    let owned = path == SOURCE
+    let source_path = is_source_path(path);
+    let owned = source_path
         || path == "/api/event"
         || path == "/api/experimental/event"
         || control_id(path).is_some()
@@ -314,7 +320,7 @@ async fn handle(mut request: Request<Incoming>, state: Arc<State>) -> Response<B
         return forward(request, state).await;
     }
     let origin = request.headers().get(header::ORIGIN).cloned();
-    let response = if request.method() == Method::OPTIONS && path != SOURCE {
+    let response = if request.method() == Method::OPTIONS && !source_path {
         Response::builder()
             .status(204)
             .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, PUT, OPTIONS")
@@ -344,7 +350,7 @@ async fn handle(mut request: Request<Incoming>, state: Arc<State>) -> Response<B
             );
         }
         response
-    } else if path == SOURCE {
+    } else if source_path {
         failure(StatusCode::NOT_FOUND, "Not found")
     } else if request.method() == Method::GET
         && ["/api/event", "/api/experimental/event"].contains(&path)
@@ -483,6 +489,14 @@ fn router_error(error: RouterError, id: &str) -> Response<Body> {
 }
 
 fn strip_hop(headers: &mut HeaderMap, upgrade: bool) {
+    // TE is hop-by-hop, but recreate its sole proxy-safe value on the next hop:
+    // Hyper's HTTP/1 server otherwise suppresses response trailer frames.
+    let trailers = headers
+        .get_all(header::TE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|v| v.trim().eq_ignore_ascii_case("trailers"));
     let dynamic: Vec<String> = headers
         .get_all(header::CONNECTION)
         .iter()
@@ -491,7 +505,33 @@ fn strip_hop(headers: &mut HeaderMap, upgrade: bool) {
         .map(|v| v.trim().to_owned())
         .collect();
     let protocol = headers.get(header::UPGRADE).cloned();
-    for name in dynamic {
+    // Re-declare end-to-end trailers for the newly framed outgoing HTTP/1 body.
+    let declared: Vec<String> = headers
+        .get_all(header::TRAILER)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| {
+            http::HeaderName::from_bytes(v.as_bytes()).is_ok()
+                && !dynamic.iter().any(|name| name.eq_ignore_ascii_case(v))
+                && ![
+                    "connection",
+                    "keep-alive",
+                    "proxy-authenticate",
+                    "proxy-authorization",
+                    "te",
+                    "trailer",
+                    "transfer-encoding",
+                    "upgrade",
+                    "proxy-connection",
+                    "content-length",
+                    "host",
+                ]
+                .contains(&v.as_str())
+        })
+        .collect();
+    for name in &dynamic {
         headers.remove(name);
     }
     for name in [
@@ -510,6 +550,12 @@ fn strip_hop(headers: &mut HeaderMap, upgrade: bool) {
     if upgrade && let Some(protocol) = protocol {
         headers.insert(header::UPGRADE, protocol);
         headers.insert(header::CONNECTION, "upgrade".parse().unwrap());
+    }
+    if trailers {
+        headers.insert(header::TE, "trailers".parse().unwrap());
+    }
+    if !declared.is_empty() {
+        headers.insert(header::TRAILER, declared.join(", ").parse().unwrap());
     }
 }
 async fn forward(mut request: Request<Incoming>, state: Arc<State>) -> Response<Body> {
