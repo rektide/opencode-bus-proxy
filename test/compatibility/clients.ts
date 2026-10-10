@@ -34,6 +34,15 @@ import {
 
 const root = resolve(import.meta.dir, "../..")
 const binary = process.env.BUS_PROXY_BINARY ?? resolve(root, "target/debug/opencode-bus-proxy")
+const contractText = await Bun.file(
+  resolve(root, "../opencode-bus-smart/packages/protocol/fixtures/event-scope-v1.json"),
+).text()
+assert.equal(
+  await Bun.file(resolve(root, "crates/protocol/fixtures/event-scope-v1.json")).text(),
+  contractText,
+  "native and Rust delivery fixtures must be byte-identical",
+)
+const contract = JSON.parse(contractText)
 const password = crypto.randomUUID()
 const headers = {
   authorization: `Basic ${Buffer.from(`opencode:${password}`).toString("base64")}`,
@@ -44,7 +53,7 @@ const secondSession = SessionID.make("ses_proxy_fixture_b")
 const assistantMessageID = SessionMessage.ID.make("msg_proxy_fixture")
 const marker = Bus.ephemeral({
   type: "rpc.proxy-fixture.barrier",
-  schema: { label: Schema.String },
+  schema: { label: Schema.String, sessionID: Schema.String },
 })
 const temp = await mkdtemp("/home/rektide/tmp-opencode/bus-proxy-compat-")
 
@@ -121,10 +130,26 @@ try {
             (await fetch(`${baseUrl}/_bus/health`, { headers: { cookie, origin: "http://localhost:1" } })).status,
             401,
           )
-          const api = OpenCode.make({ baseUrl, headers })
+          const checkedFetch = Object.assign(
+            async (input: RequestInfo | URL, init?: RequestInit) => {
+              const request = input instanceof Request ? input : new Request(input, init)
+              const response = await fetch(request)
+              if (
+                request.method === "GET" &&
+                ["/api/event", "/api/experimental/event"].includes(new URL(request.url).pathname) &&
+                response.ok
+              ) {
+                assert.equal(response.headers.get(contract.capability.header), contract.capability.value)
+              }
+              return response
+            },
+            { preconnect: fetch.preconnect },
+          )
+          const api = OpenCode.make({ baseUrl, headers, fetch: checkedFetch })
           const direct = OpenCode.make({
             baseUrl: origin.url.toString(),
             headers,
+            fetch: checkedFetch,
           })
           const signal = () => {
             const controller = new AbortController()
@@ -161,7 +186,7 @@ try {
             return { feed, iterator }
           }
           const first = await focused(api, firstSession)
-          const second = await focused(OpenCode.make({ baseUrl, headers }), secondSession)
+          const second = await focused(OpenCode.make({ baseUrl, headers, fetch: checkedFetch }), secondSession)
           const directFirst = await focused(direct, firstSession)
           const readers = [legacy, first.iterator, second.iterator, directFirst.iterator]
           const publish = async (sessionID: SessionID) => {
@@ -219,7 +244,9 @@ try {
           const batches = readers.map((reader) => throughBarrier(reader))
           const firstIDs = await publish(firstSession)
           const secondIDs = await publish(secondSession)
-          const barrier = await Effect.runPromise(bus.publish(marker, { label: "initial" }, { location }))
+          const barrier = await Effect.runPromise(
+            bus.publish(marker, { label: "initial", sessionID: firstSession }, { location }),
+          )
           const received = await deadline(Promise.all(batches))
           assert.deepEqual(received, [
             [...firstIDs, ...secondIDs, barrier.id],
@@ -236,7 +263,9 @@ try {
           const changed = readers.map((reader) => throughBarrier(reader))
           const firstAfter = await publish(firstSession)
           const secondAfter = await publish(secondSession)
-          const changedBarrier = await Effect.runPromise(bus.publish(marker, { label: "replaced" }, { location }))
+          const changedBarrier = await Effect.runPromise(
+            bus.publish(marker, { label: "replaced", sessionID: firstSession }, { location }),
+          )
           assert.deepEqual(await deadline(Promise.all(changed)), [
             [...firstAfter, ...secondAfter, changedBarrier.id],
             [...secondAfter, changedBarrier.id],
@@ -244,7 +273,13 @@ try {
             [...firstAfter, changedBarrier.id],
           ])
 
-          assert.deepEqual(requests, { source: 1, controlled: 1, legacy: 0 })
+          assert.deepEqual(requests, { source: 0, controlled: 1, legacy: 1 })
+          // The extra source API really disappeared at origin, not just behind a proxy denial.
+          for (const server of [origin.url.toString().replace(/\/$/, ""), baseUrl]) {
+            const removed = await fetch(`${server}/api/experimental/event/source`, { headers })
+            assert.equal(removed.status, 404)
+            await removed.body?.cancel()
+          }
           const inspection = await fetch(`${baseUrl}/_bus/subscriptions`, {
             headers,
           })
@@ -252,7 +287,7 @@ try {
           assert.match(await inspection.text(), /ses_proxy_fixture_b/)
           assert.equal((await api.server.info()).version, "proxy-compatibility-test")
           console.log(
-            "PASS: real Bus -> one origin source -> Rust proxy -> unchanged legacy and bus-smart clients; all five types, broad RPC, live interest replacement, direct-origin smart client, auth and HTTP forwarding",
+            "PASS: real Bus -> one ordinary /api/event -> Rust proxy -> unchanged legacy and bus-smart clients; additive scope and headers, shared contract, native schema compatibility, all five types, broad RPC, live interest replacement, direct-origin smart client, auth and HTTP forwarding",
           )
         } finally {
           controllers.forEach((controller) => controller.abort())
@@ -277,14 +312,29 @@ try {
   await rm(temp, { recursive: true, force: true })
 }
 
-async function throughBarrier(reader: AsyncIterator<{ id?: string; type: string }>) {
+async function throughBarrier(reader: AsyncIterator<unknown>) {
   const ids: string[] = []
   while (true) {
     const event = await reader.next()
     assert.equal(event.done, false)
-    Schema.decodeUnknownSync(ControlledFeedItem)(event.value)
-    if (event.value.id) ids.push(event.value.id)
-    if (event.value.type === marker.type) return ids
+    const decoded = Schema.decodeUnknownSync(ControlledFeedItem)(event.value)
+    if (decoded.type === "event-feed.ready" || decoded.type === "server.connected") {
+      throw new Error("Unexpected second transport marker after activation")
+    }
+    assert.ok(decoded.scope, "updated native schema must retain authoritative scope")
+    assert.deepEqual(decoded.scope.locations, [location])
+    assert.equal(Object.hasOwn(event.value as object, "event"), false, "business events have no source wrapper")
+    if (decoded.type === SessionEvent.Text.Delta.type) {
+      assert.equal(decoded.scope.sessionID, decoded.data.sessionID)
+      // Durable/native definitions remain unextended: an older-shaped decoder ignores scope.
+      const oldShape = Schema.decodeUnknownSync(SessionEvent.Text.Delta)(event.value)
+      assert.equal(Object.hasOwn(oldShape, "scope"), false)
+    }
+    ids.push(decoded.id)
+    if (decoded.type === marker.type) {
+      assert.equal(decoded.scope.sessionID, undefined, "RPC payload Session ID must not become authority")
+      return ids
+    }
   }
 }
 
