@@ -12,6 +12,9 @@ Session/workspace IDs require only `ses`/`wrk` prefixes. Unknown properties are
 ignored. Optional means absent, not null. Counts apply before deduplication;
 the result preserves first-seen Session order. HTTP status/tag encoding is owned
 by gateway, using the returned message and field.
+Ignored extension values are retained only as raw JSON while validating, so they
+do not acquire serde numeric-range/depth constraints. Duplicate interest keys use
+JSON.parse's last-value-wins semantics (including location keys).
 
 `SseDecoder` accepts arbitrary chunk boundaries, UTF-8 BOM only at stream start,
 CR/LF/CRLF, multiline `data` and empty data. Comments and other fields are ignored.

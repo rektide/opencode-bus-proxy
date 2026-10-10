@@ -1,7 +1,7 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::value::RawValue;
 
 use crate::{INTEREST_BYTE_CAPACITY, LOCATION_INTEREST_CAPACITY, SESSION_INTEREST_CAPACITY};
 
@@ -48,55 +48,67 @@ pub fn decode_interest(data: &[u8]) -> Result<Interest, InterestError> {
         )));
     }
     let malformed = || invalid("Invalid event interest request body");
-    let value: Value = serde_json::from_slice(data).map_err(|_| malformed())?;
-    let object = value.as_object().ok_or_else(malformed)?;
-    let locations = object
-        .get("locations")
-        .and_then(Value::as_array)
-        .ok_or_else(malformed)?;
-    let sessions = object
-        .get("sessions")
-        .and_then(Value::as_array)
-        .ok_or_else(malformed)?;
+    // Raw unknown fields need only be syntactically valid JSON: native schema
+    // strips them before validating values. In particular, parsing all fields as
+    // Value would reject ignored huge numbers or deeply nested extension values.
+    // Map decoding also preserves JSON.parse's last-key-wins duplicate semantics.
+    let object: HashMap<String, Box<RawValue>> =
+        serde_json::from_slice(data).map_err(|_| malformed())?;
+    let locations: Vec<HashMap<String, Box<RawValue>>> =
+        serde_json::from_str(object.get("locations").ok_or_else(malformed)?.get())
+            .map_err(|_| malformed())?;
+    let sessions: Vec<String> =
+        serde_json::from_str(object.get("sessions").ok_or_else(malformed)?.get())
+            .map_err(|_| malformed())?;
     let profile = match object.get("profile") {
         None => None,
-        Some(Value::String(profile)) if profile == "location" || profile == "session-streaming" => {
-            Some(profile.as_str())
+        Some(raw) => {
+            let profile: String = serde_json::from_str(raw.get()).map_err(|_| malformed())?;
+            if profile != "location" && profile != "session-streaming" {
+                return Err(malformed());
+            }
+            Some(profile)
         }
-        _ => return Err(malformed()),
     };
-    let locations = locations
+    let decoded_locations = locations
         .iter()
-        .map(|location| {
-            let object = location.as_object().ok_or_else(malformed)?;
-            let directory = object
-                .get("directory")
-                .and_then(Value::as_str)
-                .ok_or_else(malformed)?;
+        .map(|object| {
+            let directory: String =
+                serde_json::from_str(object.get("directory").ok_or_else(malformed)?.get())
+                    .map_err(|_| malformed())?;
             let workspace_id = match object.get("workspaceID") {
                 None => None,
-                Some(Value::String(id)) if id.starts_with("wrk") => Some(id.as_str()),
-                _ => return Err(malformed()),
+                Some(raw) => {
+                    let id: String = serde_json::from_str(raw.get()).map_err(|_| malformed())?;
+                    if !id.starts_with("wrk") {
+                        return Err(malformed());
+                    }
+                    Some(id)
+                }
             };
-            Ok(Location {
-                directory,
-                workspace_id,
-            })
+            Ok((directory, workspace_id))
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let locations = decoded_locations
+        .iter()
+        .map(|(directory, workspace_id)| Location {
+            directory,
+            workspace_id: workspace_id.as_deref(),
+        })
+        .collect();
     let sessions = sessions
         .iter()
         .map(|session| {
-            session
-                .as_str()
-                .filter(|id| id.starts_with("ses"))
-                .ok_or_else(malformed)
+            if !session.starts_with("ses") {
+                return Err(malformed());
+            }
+            Ok(session.as_str())
         })
         .collect::<Result<Vec<_>, _>>()?;
     let normalized = Normalized {
         locations,
         sessions,
-        profile,
+        profile: profile.as_deref(),
     };
     // This is the native post-schema reserialized UTF-8 bound, separate from
     // the raw HTTP bound. Unknown fields have been stripped, duplicates retained.

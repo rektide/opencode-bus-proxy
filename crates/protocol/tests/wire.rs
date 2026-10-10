@@ -103,6 +103,38 @@ fn interest_matches_native_brands_unknown_fields_and_dedup_order() {
 }
 
 #[test]
+fn ignored_interest_fields_do_not_acquire_number_or_depth_constraints() {
+    let nested = format!("{}0{}", "[".repeat(256), "]".repeat(256));
+    let input = format!(
+        r#"{{"locations":[{{"directory":"relative","future":{nested},"number":1e400}}],"sessions":["ses"],"profile":"session-streaming","future":{nested},"number":1e400}}"#
+    );
+    assert_eq!(decode_interest(input.as_bytes()).unwrap().sessions, ["ses"]);
+}
+
+#[test]
+fn native_interest_duplicate_properties_use_the_last_value() {
+    let input = br#"{"locations":null,"locations":[{"directory":null,"directory":"relative","workspaceID":false,"workspaceID":"wrk"}],"sessions":null,"sessions":["ses"],"profile":null,"profile":"session-streaming"}"#;
+    assert_eq!(decode_interest(input).unwrap().sessions, ["ses"]);
+    let input = br#"{"locations":[],"sessions":[],"profile":"session-streaming","profile":null}"#;
+    assert_eq!(decode_interest(input).unwrap_err().field, "interest");
+}
+
+#[test]
+fn source_large_raw_event_does_not_require_native_number_or_depth_decoding() {
+    let nested = format!("{}0{}", "[".repeat(256), "]".repeat(256));
+    let raw = format!(
+        r#"{{"number":1e400,"future":{nested},"payload":"{}"}}"#,
+        "x".repeat(1024 * 1024)
+    );
+    let input =
+        format!(r#"{{"type":"event-source.event","route":{{"kind":"broadcast"}},"event":{raw}}}"#);
+    let SourceItem::Event { event, .. } = decode_source(input.as_bytes()).unwrap() else {
+        panic!("expected event")
+    };
+    assert_eq!(event.get(), raw);
+}
+
+#[test]
 fn interest_missing_profile_differs_from_null_or_unknown() {
     for value in [
         json!({"locations":[],"sessions":[]}),
