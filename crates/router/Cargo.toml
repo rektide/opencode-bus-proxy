@@ -1,0 +1,15 @@
+[package]
+name = "bus-proxy-router"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bus-proxy-protocol.workspace = true
+bytes.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+uuid.workspace = true
