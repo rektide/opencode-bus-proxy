@@ -7,14 +7,17 @@ shared frame bytes, bounded subscriber queues, and structured `tracing`.
 - **Unchanged OpenCode V2 clients:** `/api/event` broadcasts public events.
 - **Bus-smart clients:** existing controlled GET/interest PUT selects streaming
   events by Session, while other public events remain broad.
-- **One origin connection:** bus-smart exports authoritative routing metadata;
-  the proxy never guesses interest from API reads or event payloads.
+- **One ordinary origin stream:** the proxy consumes `GET /api/event`, where
+  ordinary events gain authoritative `scope`; it never guesses Session identity
+  from arbitrary payload fields.
 - **Same server URL:** other HTTP requests stream to origin; WebSocket upgrades
   are tunneled for PTYs. Direct bus-smart connections keep working.
 
-Requires the routed-source extension implemented in the sibling
-[`opencode-bus-smart`](../opencode-bus-smart/packages/server/src/event-source.ts)
-checkout. The daemon does not embed OpenCode or open its database.
+Requires the additive scoped-event extension implemented in the sibling
+[`opencode-bus-smart`](../opencode-bus-smart/packages/protocol/src/groups/event.ts)
+checkout. Origin must advertise `OpenCode-Event-Scope: 1` on its ordinary stream.
+Existing clients can ignore the added field. The daemon does not embed OpenCode
+or open its database.
 
 ## Run
 
@@ -60,7 +63,7 @@ silently losing frames or holding up other clients.
 
 | Crate | Owns |
 | --- | --- |
-| `crates/protocol` | Source/control wire contracts and incremental SSE decoding |
+| `crates/protocol` | Ordinary scoped events, shared selection contract, control and SSE decoding |
 | `crates/router` | Session index, atomic interest replacement, bounded queues, epochs |
 | `crates/gateway` | Authentication, source lifecycle, HTTP and WebSocket transport |
 | `crates/daemon` | CLI, tracing, process supervision and shutdown |
@@ -74,10 +77,11 @@ bun run test/compatibility/clients.ts
 ```
 
 The final check requires the sibling bus-smart checkout and installed Bun
-dependencies. It creates an isolated in-memory origin and exercises its real Bus,
-HTTP routes, and client code against the compiled proxy.
+dependencies. It checks the shared contract fixtures match, creates an isolated
+in-memory origin, and exercises its real Bus, ordinary HTTP stream, and unchanged
+client/controller code against the compiled proxy.
 
 See [operations](doc/event-multiplexer/operations.md),
 [verification and measured results](doc/event-multiplexer/verification.md),
 [architecture](design/event-multiplexer/architecture.md), and the
-[source contract](design/event-multiplexer/source-contract.md).
+[additive-event contract](design/event-multiplexer/additive-events.md).

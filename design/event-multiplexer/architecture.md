@@ -2,8 +2,8 @@
 
 ## Decision
 
-Build a standalone, same-origin gateway in `opencode-bus-proxy`, with a small
-authoritative export added to `opencode-bus-smart`. The earlier
+Build a standalone, same-origin gateway in `opencode-bus-proxy`, with authoritative
+scope added to ordinary events in `opencode-bus-smart`. The earlier
 `opencode-bus-smart/design/event-multiplexer` documents are design inputs. This
 design deliberately chooses Rust and transparent API forwarding to satisfy the
 current request for unchanged client connections.
@@ -13,7 +13,7 @@ flowchart LR
     Legacy["Unchanged OpenCode V2 client"] --> Gateway["Rust gateway: HTTP / WebSocket forwarding"]
     Smart["Bus-smart client"] --> Gateway
     Gateway -->|"commands, reads, PTY"| Origin["Bus-smart: Session execution and database"]
-    Origin -->|"one routed public SSE source"| Router["Rust admission owner and Session index"]
+    Origin -->|"one ordinary /api/event stream + scope"| Router["Rust admission owner and Session index"]
     Router -->|"all public events"| Legacy
     Router -->|"selected streaming + broad events"| Smart
     Smart -->|"complete interest PUT"| Router
@@ -28,17 +28,20 @@ headers, API reads, or arbitrary `data.sessionID` fields are not subscriptions.
 
 ## Source authority and delivery
 
-[The source contract](source-contract.md) defines a versioned SSE export. Origin
-classifies a public event once and copies Bus's authoritative Session identity.
-The proxy decodes only that envelope, retaining the public event as raw JSON. It
-constructs one shared `Bytes` SSE frame, cloned by reference into selected queues.
-No per-client JSON serialization or full native-event schema is needed in Rust.
+[The additive-event contract](additive-events.md) uses ordinary `GET /api/event`,
+with `OpenCode-Event-Scope: 1` negotiation and an optional top-level `scope` on the
+normal event envelope. Origin copies Bus's publication-time Session/Location
+facts. The proxy parses routing-relevant metadata and preserves the complete
+scoped event as raw JSON. One shared `Bytes` SSE frame is cloned by reference into
+selected queues. No per-client JSON serialization or full native-event schema is
+needed in Rust. The former private source route and wrappers are retired.
 
 The existing five streaming types are Session-selective. RPC events, durable
 Session events, permissions, forms, and other public events remain broad. A
-Session-routed event without authoritative identity reaches only legacy clients.
-Routing stays with the origin so new payload shapes do not require speculative
-Rust payload inspection. Version changes must explicitly negotiate new semantics.
+streaming event without authoritative identity reaches only legacy clients.
+Scope authority stays with origin; delivery selection belongs to each distributor.
+A shared versioned fixture pins the five-type policy across native TS and Rust,
+without speculative inspection of event payloads. Future public types stay broad.
 
 There is one eager source connection and one reconnect owner per daemon. This
 changes origin fan-out from client-count queue admissions to one export admission.
@@ -51,7 +54,7 @@ after the basic topology is measured; it adds synchronization obligations.
 
 | Crate | Responsibility |
 | --- | --- |
-| `bus-proxy-protocol` | Source envelopes, incremental bounded SSE decoding, existing interest validation, ready/connected/error JSON framing |
+| `bus-proxy-protocol` | Scoped ordinary events, selection contract, bounded SSE decoding, interest validation and native handshake framing |
 | `bus-proxy-router` | Subscription lifetime, indexed admission, complete replacement, bounded queues, epoch invalidation, inspectable state/counters |
 | `bus-proxy-gateway` | Upstream connection/retry, authentication integration, SSE endpoints, streaming HTTP and WebSocket proxying, health/metrics |
 | `opencode-bus-proxy` | CLI configuration, tracing subscriber, signal/shutdown composition |
@@ -90,15 +93,16 @@ clients reopen streams and install fresh interests through their existing retry
 owners. No downstream stream survives a hidden upstream gap.
 
 An epoch is volatile, with no replay cursor or exactly-once claim. Comments are
-heartbeats; there is no per-token logging. Invalid source framing or envelope is
+heartbeats; there is no per-token logging. The upstream's normal `server.connected`
+ID names its epoch. Missing capability, invalid source framing, or malformed scope is
 a source failure, not an event to silently skip. Normal API traffic remains
 forwardable while the event source reconnects.
 
 ## Compatibility and authentication
 
 Intercept the existing legacy GET, controlled GET, and interest PUT paths. Reserve
-`/_bus/` for proxy diagnostics and refuse downstream access to the internal source
-path. Stream other request/response bodies without buffering, preserve status and
+`/_bus/` for proxy diagnostics. There is no internal source route to intercept.
+Stream other request/response bodies without buffering, preserve status and
 end-to-end headers, strip HTTP hop-by-hop headers, and tunnel successful protocol
 upgrades so PTYs work. Do not follow redirects on behalf of callers.
 

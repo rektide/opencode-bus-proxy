@@ -1,5 +1,10 @@
 # Build seams
 
+**Initial implementation record.** The source-envelope interfaces below describe
+the first build. The current wire decision is
+[additive scoped events on ordinary `/api/event`](additive-events.md); concrete
+Rust APIs are maintained with their crates as that migration replaces these seams.
+
 These concrete interfaces coordinate independent crate implementation. The source
 wire shape is [source-contract.md](source-contract.md). Types below are public;
 internal decomposition belongs to each crate owner. Corrections should update

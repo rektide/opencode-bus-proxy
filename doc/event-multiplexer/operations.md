@@ -2,12 +2,18 @@
 
 ## Topology
 
-Run one proxy against one bus-smart origin with
-`GET /api/experimental/event/source` installed. The upstream URL is an HTTP(S)
+Run one proxy against one bus-smart origin whose ordinary `GET /api/event`
+advertises `OpenCode-Event-Scope: 1`. The upstream URL is an HTTP(S)
 origin, without credentials, query, or a route prefix. Clients use the proxy as
 their complete server URL; the gateway owns event GETs and interest PUTs and
 forwards other routes. Ordinary HTTP traffic can continue while the event source
 reconnects.
+
+The origin sends ordinary OpenCode events plus authoritative `scope`; the proxy
+forwards those same events. A normal `server.connected` ID identifies the upstream
+epoch. The earlier private source route and `event-source.*` envelopes have been
+removed. An older origin lacking the capability is rejected explicitly; ordinary
+client compatibility does not imply that every old origin supplies routing facts.
 
 Client interest is exact Session identity. The five native fragment types are
 selective; lifecycle events, RPC, permissions, and forms are broadcast. Sessions
@@ -43,7 +49,7 @@ Use `--help` for current defaults. The configurable limits are:
   shared. These bounds exclude bytes already yielded to HTTP/kernel buffers.
 - `--max-subscribers`: includes inactive subscriptions waiting for their first PUT.
 - `--command-capacity`: bounded admission/control mailbox.
-- `--max-source-frame-bytes`: incremental SSE envelope limit; decoder counts
+- `--max-source-frame-bytes`: incremental ordinary SSE frame limit; decoder counts
   non-newline frame bytes including comments/field prefixes. Origin independently
   limits its complete encoded frame to 16 MiB.
 - `--source-idle-seconds`: counts any source bytes, including 15-second heartbeat
@@ -60,7 +66,7 @@ Interest bodies are capped at 256 KiB, 1024 Locations, and 4096 Session entries
 before deduplication, matching native controlled delivery.
 
 Queue overflow invalidates that subscriber, cancels its receiver, and removes all
-memberships. Source EOF, bad framing/envelope, unsupported protocol version, and
+memberships. Source EOF, bad framing/scope, missing or unsupported capability, and
 idle failure invalidate the whole source epoch and all attached subscription IDs.
 Queued old-epoch events are discarded. Bytes already handed to the network cannot
 be recalled. One reconnect loop establishes a new source epoch with capped backoff.
@@ -96,7 +102,9 @@ Run the workspace tests, Clippy and formatting commands in the root README.
 `test/compatibility/clients.ts` uses the sibling bus-smart checkout's real routing
 and generated clients, an in-memory database, isolated listeners, and temporary
 configuration. It starts no managed service and executes no model calls. Set
-`BUS_PROXY_BINARY` to test a different compiled binary.
+`BUS_PROXY_BINARY` to test a different compiled binary. It also checks the native
+and Rust copies of `event-scope-v1.json` are identical, and that ordinary clients
+and updated native decoders handle scoped events through the same routes.
 
 The router's release benchmark is in `crates/router/examples/routing_bench.rs`:
 

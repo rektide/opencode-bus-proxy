@@ -1,5 +1,10 @@
 # Routed public source, version 1
 
+**Historical predecessor.** Superseded by
+[additive scoped events on ordinary `/api/event`](additive-events.md). The private
+route and envelopes below describe the first implementation, not the current
+transport contract.
+
 Implementation contract for the bus-smart origin and Rust proxy. The earlier
 [Effect mux draft](../../../opencode-bus-smart/design/event-multiplexer/draft0.gpt6a.md)
 is background; this source boundary supports a same-origin Rust gateway.
