@@ -17,6 +17,8 @@ by the source decoder. No socket, HTTP, native payload parsing, or replay is her
   with `event-feed.ready` and remain inactive until first replacement. Activation
   admits `server.connected` before adding memberships. Later replacements do not
   create another connected frame or flush already admitted data.
+  Subscription IDs use the native `evsub_<32 lowercase hex>` format; a bare UUID
+  is not accepted by the native ready-frame schema.
 - Admission and complete replacement are actor turns with no internal awaits.
   Concurrent operations are ordered at the actor, not by upstream publication or
   HTTP receipt. A canceled caller may have already committed its command.
@@ -43,6 +45,12 @@ by the source decoder. No socket, HTTP, native payload parsing, or replay is her
 - Cancellation is checked in receive, offer and replacement. Bytes already
   returned to the consumer cannot be recalled. Socket/TLS/kernel buffering and
   write deadlines belong to the gateway.
+
+Tracing retains one `event.subscription` span in each actor-owned subscriber,
+under the `event.router` task span. Registration/removal/reset events use that
+lifetime context; complete replacements create `event.subscription.replace`
+control spans. There is no per-publication or per-recipient span creation and no
+payload/session-name logging. Source and HTTP spans belong to the gateway.
 
 ## Snapshot contract
 
