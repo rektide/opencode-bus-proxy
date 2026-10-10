@@ -123,11 +123,14 @@ pub async fn serve(
     {
         return Err(GatewayError::Configuration("limits must be positive"));
     }
+    let mut http_connector = HttpConnector::new();
+    http_connector.enforce_http(false);
+    http_connector.set_connect_timeout(Some(config.request_timeout));
     let connector = hyper_rustls::HttpsConnectorBuilder::new()
         .with_webpki_roots()
         .https_or_http()
         .enable_http1()
-        .build();
+        .wrap_connector(http_connector);
     let client = Client::builder(TokioExecutor::new()).build(connector);
     let stop = shutdown.child_token();
     let state = Arc::new(State {
@@ -596,7 +599,15 @@ async fn forward(mut request: Request<Incoming>, state: Arc<State>) -> Response<
     let request = request.map(|body| body.map_err(|e| -> BoxError { Box::new(e) }).boxed_unsync());
     let response = tokio::select! {
         _ = state.shutdown.cancelled() => return failure(StatusCode::SERVICE_UNAVAILABLE, "Gateway stopping"),
-        response = tokio::time::timeout(state.config.request_timeout, state.client.request(request)) => response,
+        response = async {
+            if upgrade {
+                tokio::time::timeout(state.config.request_timeout, state.client.request(request)).await
+            } else {
+                // Model execution and uploads can legitimately precede response headers
+                // by minutes. Only the connector, not the operation, has a deadline.
+                Ok(state.client.request(request).await)
+            }
+        } => response,
     };
     let mut response = match response {
         Ok(Ok(value)) => value,

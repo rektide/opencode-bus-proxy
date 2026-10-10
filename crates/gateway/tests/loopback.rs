@@ -55,12 +55,17 @@ struct Harness {
     router: tokio::task::JoinHandle<()>,
     origin: tokio::task::JoinHandle<()>,
     sources: mpsc::Receiver<mpsc::Sender<Bytes>>,
+    probes: mpsc::Receiver<&'static str>,
 }
 impl Harness {
     async fn new() -> Self {
+        Self::with_config(Config::default()).await
+    }
+    async fn with_config(mut config: Config) -> Self {
         let origin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let upstream = format!("http://{}", origin_listener.local_addr().unwrap());
         let (source_tx, sources) = mpsc::channel(8);
+        let (probe_tx, probes) = mpsc::channel(8);
         let stop = CancellationToken::new();
         let origin_stop = stop.clone();
         let origin = tokio::spawn(async move {
@@ -70,10 +75,11 @@ impl Harness {
                     _ = origin_stop.cancelled() => break,
                     Some(_) = connections.join_next(), if !connections.is_empty() => {},
                     result = origin_listener.accept() => {
-                        let (socket, _) = result.unwrap(); let source_tx = source_tx.clone();
+                        let (socket, _) = result.unwrap(); let source_tx = source_tx.clone(); let probe_tx = probe_tx.clone();
                         connections.spawn(async move {
                             let service = service_fn(move |mut request: Request<Incoming>| {
                                 let source_tx = source_tx.clone();
+                                let probe_tx = probe_tx.clone();
                                 async move {
                                     let response = match request.uri().path() {
                                         "/api/experimental/event/source" => {
@@ -87,6 +93,17 @@ impl Harness {
                                         "/pair" => {
                                             let port = request.headers()["host"].to_str().unwrap().rsplit(':').next().unwrap();
                                             Response::builder().status(302).header("location", "/").header("set-cookie", format!("opencode_session_{port}={}; Path=/; HttpOnly; SameSite=Lax", token())).body(full("paired")).unwrap()
+                                        },
+                                        "/delayed" => {
+                                            tokio::time::sleep(Duration::from_millis(250)).await;
+                                            Response::new(full("completed"))
+                                        },
+                                        "/upload" | "/cancel-upload" => {
+                                            let cancel_probe = request.uri().path() == "/cancel-upload";
+                                            if cancel_probe { probe_tx.send("upload-started").await.unwrap(); }
+                                            let collected = request.into_body().collect().await;
+                                            if cancel_probe { let _ = probe_tx.send(if collected.is_err() { "upload-canceled" } else { "upload-completed" }).await; }
+                                            Response::new(full(collected.map(|v| v.to_bytes()).unwrap_or_default()))
                                         },
                                         "/upgrade" => {
                                             let upgrade = hyper::upgrade::on(&mut request);
@@ -122,13 +139,10 @@ impl Harness {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let (router_handle, router) = Router::spawn(Limits::default(), stop.clone()).unwrap();
-        let config = Config {
-            upstream,
-            password: Some("secret".into()),
-            source_idle_timeout: Duration::from_secs(2),
-            max_source_frame_bytes: 1024,
-            ..Config::default()
-        };
+        config.upstream = upstream;
+        config.password = Some("secret".into());
+        config.source_idle_timeout = Duration::from_secs(2);
+        config.max_source_frame_bytes = 1024;
         let gateway = tokio::spawn(serve(listener, config, router_handle, stop.clone()));
         Self {
             base,
@@ -138,6 +152,7 @@ impl Harness {
             router,
             origin,
             sources,
+            probes,
         }
     }
     fn request(&self, method: &str, path: &str, body: Body) -> Request<Body> {
@@ -200,6 +215,80 @@ impl Harness {
         self.router.await.unwrap();
         self.origin.await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn ordinary_operations_outlive_setup_timeout_but_remain_cancelable() {
+    let mut harness = Harness::with_config(Config {
+        request_timeout: Duration::from_millis(100),
+        ..Config::default()
+    })
+    .await;
+    let _source = harness.sources.recv().await.unwrap();
+    harness.ready().await;
+    let response = harness
+        .client
+        .request(harness.request("GET", "/delayed", full(Bytes::new())))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.into_body().collect().await.unwrap().to_bytes(),
+        "completed"
+    );
+    let (tx, rx) = mpsc::channel(4);
+    let stream = futures_util::stream::unfold(rx, |mut rx| async {
+        rx.recv().await.map(|frame| (Ok::<_, Error>(frame), rx))
+    });
+    let request = harness.request(
+        "POST",
+        "/upload",
+        StreamBody::new(Box::pin(stream)).boxed_unsync(),
+    );
+    let client = harness.client.clone();
+    let upload = tokio::spawn(async move { client.request(request).await.unwrap() });
+    tx.send(Frame::data(Bytes::from_static(b"first")))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    tx.send(Frame::data(Bytes::from_static(b"second")))
+        .await
+        .unwrap();
+    drop(tx);
+    let response = upload.await.unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.into_body().collect().await.unwrap().to_bytes(),
+        "firstsecond"
+    );
+
+    let address = harness.base.strip_prefix("http://").unwrap();
+    let mut socket = TcpStream::connect(address).await.unwrap();
+    socket.write_all(format!("POST /cancel-upload HTTP/1.1\r\nHost: {address}\r\nContent-Length: 999\r\n\r\npartial").as_bytes()).await.unwrap();
+    assert_eq!(harness.probes.recv().await.unwrap(), "upload-started");
+    drop(socket);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), harness.probes.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        "upload-canceled"
+    );
+
+    let request = harness.request(
+        "POST",
+        "/upload",
+        StreamBody::new(futures_util::stream::pending::<Result<Frame<Bytes>, Error>>())
+            .boxed_unsync(),
+    );
+    let client = harness.client.clone();
+    let pending = tokio::spawn(async move { client.request(request).await });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    harness.close().await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), pending)
+        .await
+        .unwrap()
+        .unwrap();
 }
 struct Feed {
     body: Incoming,
