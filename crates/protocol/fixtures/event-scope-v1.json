@@ -1,0 +1,87 @@
+{
+  "version": 1,
+  "capability": {
+    "header": "OpenCode-Event-Scope",
+    "value": "1"
+  },
+  "profile": "session-streaming",
+  "streamingTypes": [
+    "session.text.delta",
+    "session.reasoning.delta",
+    "session.tool.input.delta",
+    "session.tool.progress",
+    "session.compaction.delta"
+  ],
+  "cases": [
+    {
+      "name": "focused text with workspace-aware scope",
+      "event": {
+        "id": "evt_fixture_text",
+        "created": 1,
+        "type": "session.text.delta",
+        "data": {
+          "sessionID": "ses_payload",
+          "assistantMessageID": "msg_fixture",
+          "ordinal": 0,
+          "delta": "hello"
+        },
+        "scope": {
+          "sessionID": "ses_authority",
+          "locations": [{ "directory": "/work/app", "workspaceID": "wrk_fixture" }]
+        }
+      },
+      "expected": { "kind": "session", "sessionID": "ses_authority" }
+    },
+    {
+      "name": "missing authoritative identity never falls back to payload",
+      "event": {
+        "id": "evt_fixture_unscoped_session",
+        "created": 1,
+        "type": "session.text.delta",
+        "data": {
+          "sessionID": "ses_payload",
+          "assistantMessageID": "msg_fixture",
+          "ordinal": 0,
+          "delta": "hello"
+        },
+        "scope": { "locations": [] }
+      },
+      "expected": { "kind": "session" }
+    },
+    {
+      "name": "session lifecycle remains broad",
+      "event": {
+        "id": "evt_fixture_renamed",
+        "created": 1,
+        "type": "session.renamed",
+        "durable": { "aggregateID": "ses_authority", "seq": 1, "version": 1 },
+        "data": { "sessionID": "ses_authority", "title": "renamed" },
+        "scope": { "sessionID": "ses_authority" }
+      },
+      "expected": { "kind": "broadcast" }
+    },
+    {
+      "name": "RPC payload Session is not scope authority",
+      "event": {
+        "id": "evt_fixture_rpc",
+        "created": 1,
+        "type": "rpc.fixture.progress",
+        "location": { "directory": "/work/app" },
+        "data": { "sessionID": "ses_payload", "progress": 1 },
+        "scope": { "locations": [{ "directory": "/work/app" }] }
+      },
+      "expected": { "kind": "broadcast" }
+    },
+    {
+      "name": "unknown public types stay broad",
+      "event": {
+        "id": "evt_fixture_future",
+        "created": 1,
+        "type": "future.public.event",
+        "data": { "sessionID": "ses_payload", "newField": true },
+        "scope": {}
+      },
+      "expected": { "kind": "broadcast" }
+    }
+  ]
+}

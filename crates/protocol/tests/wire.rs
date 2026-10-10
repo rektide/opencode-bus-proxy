@@ -1,9 +1,10 @@
 use bus_proxy_protocol::{
     INTEREST_BYTE_CAPACITY, LOCATION_INTEREST_CAPACITY, ProtocolError, Route,
-    SESSION_INTEREST_CAPACITY, SourceItem, SseDecoder, connected_frame, decode_interest,
-    decode_source, event_frame, ready_frame,
+    SESSION_INTEREST_CAPACITY, SseDecoder, UpstreamEvent, connected_frame, decode_event,
+    decode_interest, event_frame, ready_frame,
 };
-use serde_json::{Value, json, value::RawValue};
+use bytes::Bytes;
+use serde_json::{Value, json};
 
 fn interest(
     value: Value,
@@ -12,9 +13,96 @@ fn interest(
 }
 
 #[test]
+fn normative_scope_fixture_pins_policy_and_cases() {
+    use bus_proxy_protocol::{EVENT_SCOPE_HEADER, EVENT_SCOPE_VERSION, STREAMING_TYPES};
+    let fixture: Value =
+        serde_json::from_str(include_str!("../fixtures/event-scope-v1.json")).unwrap();
+    assert_eq!(fixture["capability"]["header"], EVENT_SCOPE_HEADER);
+    assert_eq!(fixture["capability"]["value"], EVENT_SCOPE_VERSION);
+    assert_eq!(fixture["streamingTypes"], json!(STREAMING_TYPES));
+    for case in fixture["cases"].as_array().unwrap() {
+        let UpstreamEvent::Domain { route, .. } =
+            decode_event(Bytes::from(case["event"].to_string())).unwrap()
+        else {
+            panic!("domain")
+        };
+        assert_eq!(
+            route,
+            serde_json::from_value::<Route>(case["expected"].clone()).unwrap(),
+            "{}",
+            case["name"]
+        );
+    }
+    for kind in STREAMING_TYPES {
+        let input = json!({"type":kind,"scope":{"sessionID":"ses"}}).to_string();
+        assert!(matches!(
+            decode_event(Bytes::from(input)).unwrap(),
+            UpstreamEvent::Domain {
+                route: Route::Session { .. },
+                ..
+            }
+        ));
+    }
+}
+
+#[test]
+fn scope_validation_and_native_duplicate_semantics() {
+    let escaped = br#"{"\u0074ype":"session.text.delta","\u0073cope":{"session\u0049D":"ses_escaped","locations":[{"\u0064irectory":"","workspace\u0049D":"wrk"}]}}"#;
+    assert!(
+        matches!(decode_event(Bytes::from_static(escaped)).unwrap(), UpstreamEvent::Domain { route: Route::Session { session_id: Some(id) }, .. } if id == "ses_escaped")
+    );
+    for scope in [
+        json!(null),
+        json!([]),
+        json!({"sessionID":null}),
+        json!({"sessionID":"wrong"}),
+        json!({"locations":null}),
+        json!({"locations":[null]}),
+        json!({"locations":[{}]}),
+        json!({"locations":[{"directory":2}]}),
+        json!({"locations":[{"directory":"","workspaceID":null}]}),
+        json!({"locations":[{"directory":"","workspaceID":"wrong"}]}),
+    ] {
+        assert!(
+            decode_event(Bytes::from(
+                json!({"type":"future","scope":scope}).to_string()
+            ))
+            .is_err()
+        );
+    }
+    for scope in [
+        json!({}),
+        json!({"locations":[]}),
+        json!({"sessionID":"ses","locations":[{"directory":"","workspaceID":"wrk"},{"directory":"relative"}],"future":true}),
+    ] {
+        assert!(
+            decode_event(Bytes::from(
+                json!({"type":"future","scope":scope}).to_string()
+            ))
+            .is_ok()
+        );
+    }
+    let raw = br#"{"type":null,"type":"session.text.delta","scope":null,"scope":{"sessionID":null,"sessionID":"ses_last","locations":null,"locations":[{"directory":null,"directory":"relative","workspaceID":null,"workspaceID":"wrk"}]}}"#;
+    assert!(
+        matches!(decode_event(Bytes::from_static(raw)).unwrap(), UpstreamEvent::Domain { route: Route::Session { session_id: Some(id) }, .. } if id == "ses_last")
+    );
+    for raw in [
+        r#"{"type":"future"}"#,
+        r#"{"type":"server.connected","id":null}"#,
+        r#"{"type":"server.connected","id":"bad"}"#,
+        r#"{"type":"event-feed.ready"}"#,
+        r#"{"type":"future","scope":{},"scope":null}"#,
+        r#"{"type":"future","type":null,"scope":{}}"#,
+    ] {
+        assert!(decode_event(Bytes::copy_from_slice(raw.as_bytes())).is_err());
+    }
+}
+
+#[test]
 fn source_shape_and_route_are_independent_of_native_payload() {
-    let input = br#"{"type":"event-source.event","route":{"kind":"session","sessionID":"ses_owner"},"event":{ "type" : "session.text.delta", "data":{"sessionID":"ses_spoof"} }}"#;
-    let SourceItem::Event { route, event } = decode_source(input).unwrap() else {
+    let input = br#"{ "type" : "session.text.delta", "scope":{"sessionID":"ses_owner"}, "data":{"sessionID":"ses_spoof"} }"#;
+    let UpstreamEvent::Domain { route, event } = decode_event(Bytes::from_static(input)).unwrap()
+    else {
         panic!("expected event")
     };
     assert_eq!(
@@ -23,14 +111,11 @@ fn source_shape_and_route_are_independent_of_native_payload() {
             session_id: Some("ses_owner".into())
         }
     );
-    assert_eq!(
-        event.get(),
-        r#"{ "type" : "session.text.delta", "data":{"sessionID":"ses_spoof"} }"#
-    );
-    let input = br#"{"type":"event-source.event","route":{"kind":"session"},"event":{"data":{"sessionID":"ses_spoof"}}}"#;
+    assert_eq!(event.as_ref(), input);
+    let input = br#"{"type":"session.text.delta","scope":{},"data":{"sessionID":"ses_spoof"}}"#;
     assert!(matches!(
-        decode_source(input).unwrap(),
-        SourceItem::Event {
+        decode_event(Bytes::from_static(input)).unwrap(),
+        UpstreamEvent::Domain {
             route: Route::Session { session_id: None },
             ..
         }
@@ -39,23 +124,22 @@ fn source_shape_and_route_are_independent_of_native_payload() {
 
 #[test]
 fn future_broad_event_is_not_schema_decoded_or_reserialized() {
-    let event = r#"{ "type":"future.public.event", "largeNumber":900719925474099312345, "float":1.2300e+03, "escaped":"\u0061", "data":{"sessionID":"ses_spoof"} }"#;
-    let input = format!(
-        r#"{{"unknown":true,"event":{event},"route":{{"kind":"broadcast"}},"type":"event-source.event"}}"#
-    );
-    let SourceItem::Event { route, event: raw } = decode_source(input.as_bytes()).unwrap() else {
+    let event = r#"{ "type":"future.public.event", "scope":{}, "largeNumber":900719925474099312345, "float":1.2300e+03, "escaped":"\u0061", "data":{"sessionID":"ses_spoof"} }"#;
+    let UpstreamEvent::Domain { route, event: raw } =
+        decode_event(Bytes::from_static(event.as_bytes())).unwrap()
+    else {
         panic!("expected event")
     };
     assert_eq!(route, Route::Broadcast);
-    assert_eq!(raw.get(), event);
+    assert_eq!(raw, event);
     assert_eq!(event_frame(&raw), format!("data: {event}\n\n"));
 }
 
 #[test]
 fn ready_structure_but_not_version_or_epoch_policy_is_checked() {
     assert!(matches!(
-        decode_source(br#"{"type":"event-source.ready","version":42,"epoch":""}"#).unwrap(),
-        SourceItem::Ready { version: 42, epoch } if epoch.is_empty()
+        decode_event(Bytes::from_static(br#"{"type":"server.connected","id":"evt_any-brand"}"#)).unwrap(),
+        UpstreamEvent::Connected { epoch } if epoch == "evt_any-brand"
     ));
     for input in [
         r#"{"type":"event-source.ready","version":-1,"epoch":"e"}"#,
@@ -76,7 +160,10 @@ fn ready_structure_but_not_version_or_epoch_policy_is_checked() {
         r#"{"type":"event-source.ready","type":"event-source.event"}"#,
         r#"{"type":"event-source.ready","version":1,"epoch":"e"} trailing"#,
     ] {
-        assert!(decode_source(input.as_bytes()).is_err(), "accepted {input}");
+        assert!(
+            decode_event(Bytes::copy_from_slice(input.as_bytes())).is_err(),
+            "accepted {input}"
+        );
     }
 }
 
@@ -123,15 +210,15 @@ fn native_interest_duplicate_properties_use_the_last_value() {
 fn source_large_raw_event_does_not_require_native_number_or_depth_decoding() {
     let nested = format!("{}0{}", "[".repeat(256), "]".repeat(256));
     let raw = format!(
-        r#"{{"number":1e400,"future":{nested},"payload":"{}"}}"#,
+        r#"{{"type":"future","scope":{{}},"number":1e400,"future":{nested},"payload":"{}"}}"#,
         "x".repeat(1024 * 1024)
     );
-    let input =
-        format!(r#"{{"type":"event-source.event","route":{{"kind":"broadcast"}},"event":{raw}}}"#);
-    let SourceItem::Event { event, .. } = decode_source(input.as_bytes()).unwrap() else {
+    let UpstreamEvent::Domain { event, .. } =
+        decode_event(Bytes::copy_from_slice(raw.as_bytes())).unwrap()
+    else {
         panic!("expected event")
     };
-    assert_eq!(event.get(), raw);
+    assert_eq!(event, raw);
 }
 
 #[test]
@@ -382,8 +469,7 @@ fn pretty_printed_raw_events_use_multiline_sse_not_bare_lines() {
         let raw = format!(
             "{{{newline}  \"type\": \"future.public\",{newline}  \"data\": {{\"escaped\":\"\\n\"}}{newline}}}"
         );
-        let event = RawValue::from_string(raw.clone()).unwrap();
-        let frame = event_frame(&event);
+        let frame = event_frame(raw.as_bytes());
         let output = decode_chunks(&frame, 1, 1024);
         assert_eq!(output.len(), 1);
         assert_eq!(

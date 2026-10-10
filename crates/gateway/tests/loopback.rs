@@ -105,7 +105,7 @@ async fn lifecycle_tracing_uses_only_bounded_redacted_http_metadata() {
     assert!(captured.contains("http_request"));
     assert!(captured.contains("interests"));
     assert!(captured.contains("forward"));
-    assert!(captured.contains("reason=\"envelope\""));
+    assert!(captured.contains("reason=\"event_metadata\""));
     for sensitive in [
         &id,
         "ses_private",
@@ -177,7 +177,14 @@ impl Harness {
     async fn new() -> Self {
         Self::with_config(Config::default()).await
     }
-    async fn with_config(mut config: Config) -> Self {
+    async fn with_config(config: Config) -> Self {
+        Self::with_source(config, Some("1"), None).await
+    }
+    async fn with_source(
+        mut config: Config,
+        scope_version: Option<&'static str>,
+        first: Option<&'static str>,
+    ) -> Self {
         let origin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let upstream = format!("http://{}", origin_listener.local_addr().unwrap());
         let (source_tx, sources) = mpsc::channel(8);
@@ -198,13 +205,15 @@ impl Harness {
                                 let probe_tx = probe_tx.clone();
                                 async move {
                                     let response = match request.uri().path() {
-                                        "/api/experimental/event/source" => {
+                                         "/api/event" => {
                                             assert_eq!(request.headers()["authorization"], format!("Basic {}", STANDARD.encode("opencode:secret")));
                                             let (tx, rx) = mpsc::channel(32);
-                                            tx.send(Bytes::from(format!("data: {{\"type\":\"event-source.ready\",\"version\":1,\"epoch\":\"{}\"}}\n\n", rand::random::<u64>()))).await.unwrap();
+                                             tx.send(Bytes::from(first.map(str::to_owned).unwrap_or_else(|| format!("data: {{\"type\":\"server.connected\",\"id\":\"evt_{}\",\"data\":{{}}}}\n\n", rand::random::<u64>())))).await.unwrap();
                                             source_tx.send(tx).await.unwrap();
                                             let stream = futures_util::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|bytes| (Ok::<_, Error>(Frame::data(bytes)), rx)) });
-                                            Response::builder().header("content-type", "text/event-stream").body(StreamBody::new(Box::pin(stream)).boxed_unsync()).unwrap()
+                                             let mut response = Response::builder().header("content-type", "text/event-stream");
+                                             if let Some(version) = scope_version { response = response.header("OpenCode-Event-Scope", version); }
+                                             response.body(StreamBody::new(Box::pin(stream)).boxed_unsync()).unwrap()
                                         },
                                         "/pair" => {
                                             let port = request.headers()["host"].to_str().unwrap().rsplit(':').next().unwrap();
@@ -315,6 +324,7 @@ impl Harness {
             .unwrap();
         assert_eq!(response.status(), 200);
         assert_eq!(response.headers()["x-accel-buffering"], "no");
+        assert_eq!(response.headers()["OpenCode-Event-Scope"], "1");
         Feed {
             body: response.into_body(),
             decoder: SseDecoder::new(1024 * 1024),
@@ -490,10 +500,15 @@ struct Feed {
 }
 impl Feed {
     async fn next(&mut self) -> Option<serde_json::Value> {
+        self.next_raw()
+            .await
+            .map(|data| serde_json::from_slice(&data).unwrap())
+    }
+    async fn next_raw(&mut self) -> Option<Vec<u8>> {
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
                 if let Some(data) = self.pending.pop_front() {
-                    return Some(serde_json::from_slice(&data).unwrap());
+                    return Some(data);
                 }
                 let frame = self.body.frame().await?.unwrap();
                 if let Ok(bytes) = frame.into_data() {
@@ -506,14 +521,13 @@ impl Feed {
     }
 }
 fn event(kind: &str, session: Option<&str>, marker: &str) -> Bytes {
-    let route = if kind == "broadcast" {
-        serde_json::json!({"kind":"broadcast"})
-    } else {
-        serde_json::json!({"kind":"session", "sessionID":session})
-    };
+    let mut scope = serde_json::json!({});
+    if let Some(session) = session {
+        scope["sessionID"] = session.into();
+    }
     Bytes::from(format!(
         "data: {}\n\n",
-        serde_json::json!({"type":"event-source.event","route":route,"event":{"type":"session.text.delta","id":marker,"data":{"sessionID":"payload-is-not-authority"}}})
+        serde_json::json!({"type":if kind == "broadcast" { "future.public.event" } else { "session.text.delta" },"scope":scope,"id":marker,"data":{"sessionID":"payload-is-not-authority"}})
     ))
 }
 
@@ -691,7 +705,7 @@ async fn streaming_forwarding_cookie_auth_cors_and_raw_upgrade() {
             .await
             .unwrap()
             .status(),
-        404
+        202
     );
     assert_eq!(
         harness
@@ -704,7 +718,7 @@ async fn streaming_forwarding_cookie_auth_cors_and_raw_upgrade() {
             .await
             .unwrap()
             .status(),
-        404
+        202
     );
     let address = harness.base.strip_prefix("http://").unwrap();
     let mut socket = TcpStream::connect(address).await.unwrap();
@@ -738,7 +752,7 @@ async fn invalid_source_and_idle_timeout_end_downstream() {
     feed.next().await.unwrap();
     source
         .send(Bytes::from_static(
-            b"data: {\"type\":\"event-source.ready\",\"version\":1,\"epoch\":\"repeated\"}\n\n",
+            b"data: {\"type\":\"server.connected\",\"id\":\"evt_repeated\",\"data\":{}}\n\n",
         ))
         .await
         .unwrap();
@@ -773,4 +787,181 @@ async fn invalid_source_and_idle_timeout_end_downstream() {
         "silent source must not survive with local heartbeats"
     );
     harness.close().await;
+}
+
+#[tokio::test]
+async fn negotiation_requires_supported_header_and_first_connected_marker() {
+    for (header, first) in [
+        (None, None),
+        (Some("2"), None),
+        (Some("1, 1"), None),
+        (
+            Some("1"),
+            Some("data: {\"type\":\"future\",\"scope\":{}}\n\n"),
+        ),
+        (
+            Some("1"),
+            Some("data: {\"type\":\"server.connected\",\"id\":\"bad\"}\n\n"),
+        ),
+        (Some("1"), Some("data: {\"type\":\"event-feed.ready\"}\n\n")),
+    ] {
+        let mut harness = Harness::with_source(Config::default(), header, first).await;
+        // A second request proves the first was rejected rather than becoming ready.
+        let _first = harness.sources.recv().await.unwrap();
+        let _second = tokio::time::timeout(Duration::from_secs(2), harness.sources.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let response = harness
+            .client
+            .request(harness.request("GET", "/api/event", full(Bytes::new())))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 503, "header={header:?}, first={first:?}");
+        harness.close().await;
+    }
+}
+
+#[tokio::test]
+async fn malformed_scope_and_truncated_data_retire_live_epoch() {
+    for raw in [
+        "data: {\"type\":\"future\"}\n\n",
+        "data: {\"type\":\"future\",\"scope\":null}\n\n",
+        "data: {\"type\":\"future\",\"scope\":{\"sessionID\":null}}\n\n",
+        "data: {\"type\":\"future\",\"scope\":{\"locations\":[{\"directory\":\"x\",\"workspaceID\":null}]}}\n\n",
+        "data: {\"type\":\"future\",\"scope\":{}}",
+    ] {
+        let mut harness = Harness::new().await;
+        let source = harness.sources.recv().await.unwrap();
+        harness.ready().await;
+        let mut feed = harness.feed(false).await;
+        feed.next().await.unwrap();
+        source
+            .send(Bytes::from_static(raw.as_bytes()))
+            .await
+            .unwrap();
+        drop(source);
+        assert!(feed.next().await.is_none());
+        harness.close().await;
+    }
+}
+
+#[tokio::test]
+async fn whole_json_and_scope_survive_proxy_chain_with_authoritative_selection() {
+    let mut harness = Harness::new().await;
+    let source = harness.sources.recv().await.unwrap();
+    harness.ready().await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let stop = CancellationToken::new();
+    let (router, router_task) = Router::spawn(Limits::default(), stop.clone()).unwrap();
+    let gateway = tokio::spawn(serve(
+        listener,
+        Config {
+            upstream: harness.base.clone(),
+            password: Some("secret".into()),
+            ..Config::default()
+        },
+        router.clone(),
+        stop.clone(),
+    ));
+    for _ in 0..100 {
+        if router.snapshot().await.unwrap().epoch.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(router.snapshot().await.unwrap().epoch.is_some());
+    let response = harness
+        .client
+        .request(
+            Request::builder()
+                .uri(format!("{base}/api/experimental/event"))
+                .header(
+                    "authorization",
+                    format!("Basic {}", STANDARD.encode("opencode:secret")),
+                )
+                .body(full(Bytes::new()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.headers()["OpenCode-Event-Scope"], "1");
+    let mut feed = Feed {
+        body: response.into_body(),
+        decoder: SseDecoder::new(4096),
+        pending: Default::default(),
+    };
+    let id = feed.next().await.unwrap()["data"]["subscriptionID"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    router
+        .replace(
+            id,
+            bus_proxy_protocol::Interest {
+                sessions: vec!["ses_authority".into()],
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(feed.next().await.unwrap()["type"], "server.connected");
+    source
+        .send(event("session", Some("ses_other"), "not-selected"))
+        .await
+        .unwrap();
+    source
+        .send(event("session", None, "payload-not-authority"))
+        .await
+        .unwrap();
+    let raw = b"  { \"type\":\"session.text.delta\", \"scope\":{\"sessionID\":\"ses_authority\",\"locations\":[{\"directory\":\"relative\",\"workspaceID\":\"wrk\"},{\"directory\":\"\"}]}, \"data\":{\"sessionID\":\"ses_spoof\"}, \"float\":1.2300e+03, \"escaped\":\"\\u0061\" }  ";
+    source
+        .send(bus_proxy_protocol::event_frame(raw))
+        .await
+        .unwrap();
+    assert_eq!(feed.next_raw().await.unwrap(), raw);
+    let broad = b"{\"type\":\"future.public\",\"scope\":{\"locations\":[]},\"data\":{\"sessionID\":\"ses_other\"}}";
+    source
+        .send(bus_proxy_protocol::event_frame(broad))
+        .await
+        .unwrap();
+    assert_eq!(feed.next_raw().await.unwrap(), broad);
+    drop(source);
+    assert!(
+        feed.next().await.is_none(),
+        "origin gap invalidates both proxy generations"
+    );
+    stop.cancel();
+    gateway.await.unwrap().unwrap();
+    router_task.await.unwrap();
+    harness.close().await;
+}
+
+#[tokio::test]
+async fn obvious_listener_self_targets_are_rejected() {
+    for (bind, host) in [
+        ("127.0.0.1:0", "127.0.0.1"),
+        ("127.0.0.1:0", "localhost"),
+        ("0.0.0.0:0", "127.0.0.1"),
+    ] {
+        let listener = TcpListener::bind(bind).await.unwrap();
+        let upstream = format!("http://{host}:{}", listener.local_addr().unwrap().port());
+        let stop = CancellationToken::new();
+        let (router, task) = Router::spawn(Limits::default(), stop.clone()).unwrap();
+        assert!(matches!(
+            serve(
+                listener,
+                Config {
+                    upstream,
+                    ..Config::default()
+                },
+                router,
+                stop.clone()
+            )
+            .await,
+            Err(bus_proxy_gateway::GatewayError::Configuration(_))
+        ));
+        stop.cancel();
+        task.await.unwrap();
+    }
 }

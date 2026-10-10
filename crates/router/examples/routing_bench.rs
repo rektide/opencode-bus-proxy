@@ -38,7 +38,7 @@ async fn main() {
         .to_string(),
     )
     .unwrap();
-    let frame = event_frame(&raw);
+    let frame = event_frame(raw.get().as_bytes());
     println!(
         "clients={clients} events={events} frame_bytes={} tokio_workers=4",
         frame.len()

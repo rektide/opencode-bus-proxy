@@ -2,7 +2,9 @@
 mod auth;
 
 use base64::{Engine, engine::general_purpose::STANDARD};
-use bus_proxy_protocol::{SourceItem, SseDecoder};
+use bus_proxy_protocol::{
+    EVENT_PATH, EVENT_SCOPE_HEADER, EVENT_SCOPE_VERSION, SseDecoder, UpstreamEvent,
+};
 use bus_proxy_router::{Mode, Router, RouterError};
 use bytes::Bytes;
 use http::{HeaderMap, Method, Request, Response, StatusCode, Uri, header};
@@ -34,7 +36,6 @@ use tracing::Instrument;
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type Body = UnsyncBoxBody<Bytes, BoxError>;
 type HttpClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, Body>;
-const SOURCE: &str = "/api/experimental/event/source";
 const CONTROL_PREFIX: &str = "/api/experimental/event/subscriptions/";
 const INTEREST_BYTES: usize = 262144;
 
@@ -137,6 +138,23 @@ pub async fn serve(
         || config.header_read_timeout.is_zero()
     {
         return Err(GatewayError::Configuration("limits must be positive"));
+    }
+    let local = listener.local_addr().map_err(GatewayError::Listener)?;
+    let host_ip = url.host_str().and_then(|host| {
+        host.trim_matches(['[', ']'])
+            .parse::<std::net::IpAddr>()
+            .ok()
+    });
+    let loopback =
+        url.host_str() == Some("localhost") || host_ip.is_some_and(|ip| ip.is_loopback());
+    if url.port_or_known_default() == Some(local.port())
+        && (host_ip == Some(local.ip())
+            || (loopback && (local.ip().is_loopback() || local.ip().is_unspecified()))
+            || (local.ip().is_unspecified() && host_ip.is_some_and(|ip| ip.is_unspecified())))
+    {
+        return Err(GatewayError::Configuration(
+            "upstream targets gateway listener",
+        ));
     }
     let mut http_connector = HttpConnector::new();
     http_connector.enforce_http(false);
@@ -278,7 +296,7 @@ struct SourceFailure(&'static str);
 
 async fn source_connection(state: &State, epoch: &mut Option<String>) -> Result<(), SourceFailure> {
     let mut request = Request::builder()
-        .uri(format!("{}{SOURCE}", state.base))
+        .uri(format!("{}{EVENT_PATH}", state.base))
         .header(header::ACCEPT, "text/event-stream")
         .body(full(Bytes::new()))
         .map_err(|_| SourceFailure("request_configuration"))?;
@@ -319,6 +337,14 @@ async fn source_connection(state: &State, epoch: &mut Option<String>) -> Result<
     {
         return Err(SourceFailure("content_type"));
     }
+    let mut versions = response.headers().get_all(EVENT_SCOPE_HEADER).iter();
+    if versions
+        .next()
+        .is_none_or(|value| value != EVENT_SCOPE_VERSION)
+        || versions.next().is_some()
+    {
+        return Err(SourceFailure("scope_version"));
+    }
     let mut body = response.into_body();
     let mut decoder = SseDecoder::new(state.config.max_source_frame_bytes);
     let ready_deadline = tokio::time::Instant::now() + state.config.request_timeout;
@@ -357,13 +383,10 @@ async fn source_connection(state: &State, epoch: &mut Option<String>) -> Result<
                 .push(chunk)
                 .map_err(|_| SourceFailure("framing_or_size"))?
             {
-                match bus_proxy_protocol::decode_source(&data)
-                    .map_err(|_| SourceFailure("envelope"))?
+                match bus_proxy_protocol::decode_event(Bytes::from(data))
+                    .map_err(|_| SourceFailure("event_metadata"))?
                 {
-                    SourceItem::Ready {
-                        version: 1,
-                        epoch: new,
-                    } if epoch.is_none() => {
+                    UpstreamEvent::Connected { epoch: new } if epoch.is_none() => {
                         state
                             .router
                             .begin_epoch(new.clone())
@@ -373,7 +396,7 @@ async fn source_connection(state: &State, epoch: &mut Option<String>) -> Result<
                         *epoch = Some(new);
                         tracing::info!("event source ready");
                     }
-                    SourceItem::Event { route, event } if epoch.is_some() => {
+                    UpstreamEvent::Domain { route, event } if epoch.is_some() => {
                         state
                             .router
                             .publish(
@@ -385,7 +408,7 @@ async fn source_connection(state: &State, epoch: &mut Option<String>) -> Result<
                             .map_err(|_| SourceFailure("router_admission"))?;
                         state.metrics.frames.fetch_add(1, Ordering::Relaxed);
                     }
-                    _ => return Err(SourceFailure("readiness_sequence_or_version")),
+                    _ => return Err(SourceFailure("readiness_sequence")),
                 }
             }
         }
@@ -407,9 +430,6 @@ fn method_category(method: &Method) -> &'static str {
     }
 }
 fn route_category(path: &str) -> &'static str {
-    if is_source_path(path) {
-        return "private_source";
-    }
     match path {
         "/api/event" => "legacy_feed",
         "/api/experimental/event" => "controlled_feed",
@@ -427,16 +447,9 @@ fn control_id(path: &str) -> Option<&str> {
         .strip_suffix("/interests")
         .filter(|id| !id.is_empty() && !id.contains('/'))
 }
-fn is_source_path(path: &str) -> bool {
-    // Refuse aliases an upstream URL/router could normalize to the private export.
-    let decoded = percent_encoding::percent_decode_str(path).decode_utf8_lossy();
-    url::Url::parse(&format!("http://local{decoded}")).is_ok_and(|url| url.path() == SOURCE)
-}
 async fn handle(mut request: Request<Incoming>, state: Arc<State>) -> Response<Body> {
     let path = request.uri().path();
-    let source_path = is_source_path(path);
-    let owned = source_path
-        || path == "/api/event"
+    let owned = path == "/api/event"
         || path == "/api/experimental/event"
         || control_id(path).is_some()
         || path.starts_with("/_bus/");
@@ -444,7 +457,7 @@ async fn handle(mut request: Request<Incoming>, state: Arc<State>) -> Response<B
         return forward(request, state).await;
     }
     let origin = request.headers().get(header::ORIGIN).cloned();
-    let response = if request.method() == Method::OPTIONS && !source_path {
+    let response = if request.method() == Method::OPTIONS {
         Response::builder()
             .status(204)
             .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, PUT, OPTIONS")
@@ -474,8 +487,6 @@ async fn handle(mut request: Request<Incoming>, state: Arc<State>) -> Response<B
             );
         }
         response
-    } else if source_path {
-        failure(StatusCode::NOT_FOUND, "Not found")
     } else if request.method() == Method::GET
         && ["/api/event", "/api/experimental/event"].contains(&path)
     {
@@ -497,6 +508,7 @@ async fn handle(mut request: Request<Incoming>, state: Arc<State>) -> Response<B
                 );
                 Response::builder()
                     .header(header::CONTENT_TYPE, "text/event-stream")
+                    .header(EVENT_SCOPE_HEADER, EVENT_SCOPE_VERSION)
                     .header(header::CACHE_CONTROL, "no-cache, no-transform")
                     .header("x-accel-buffering", "no")
                     .header("x-content-type-options", "nosniff")

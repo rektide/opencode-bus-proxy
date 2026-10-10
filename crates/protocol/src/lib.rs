@@ -9,10 +9,19 @@ pub use sse::SseDecoder;
 use bytes::Bytes;
 use serde::Deserialize;
 use serde_json::value::RawValue;
+use std::collections::HashMap;
 
 pub const EVENT_PATH: &str = "/api/event";
 pub const CONTROLLED_EVENT_PATH: &str = "/api/experimental/event";
-pub const SOURCE_PATH: &str = "/api/experimental/event/source";
+pub const EVENT_SCOPE_HEADER: &str = "OpenCode-Event-Scope";
+pub const EVENT_SCOPE_VERSION: &str = "1";
+pub const STREAMING_TYPES: [&str; 5] = [
+    "session.text.delta",
+    "session.reasoning.delta",
+    "session.tool.input.delta",
+    "session.tool.progress",
+    "session.compaction.delta",
+];
 pub const INTEREST_PATH_PREFIX: &str = "/api/experimental/event/subscriptions/";
 pub const INTEREST_PATH_SUFFIX: &str = "/interests";
 pub const INTEREST_BYTE_CAPACITY: usize = 256 * 1024;
@@ -40,18 +49,16 @@ fn optional_string<'de, D: serde::Deserializer<'de>>(
 }
 
 #[derive(Debug)]
-pub enum SourceItem {
-    Ready { version: u32, epoch: String },
-    Event { route: Route, event: Box<RawValue> },
+pub enum UpstreamEvent {
+    Connected { epoch: String },
+    Domain { route: Route, event: Bytes },
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProtocolError {
-    #[error("Invalid source envelope: {0}")]
+    #[error("Invalid scoped event: {0}")]
     InvalidSource(#[from] serde_json::Error),
-    #[error("Unknown source item type")]
-    UnknownSourceType,
-    #[error("Source event must be a JSON object")]
+    #[error("Invalid event metadata or scope")]
     InvalidEvent,
     #[error("SSE frame exceeds {limit} bytes")]
     FrameTooLarge { limit: usize },
@@ -63,49 +70,66 @@ pub enum ProtocolError {
     DecoderClosed,
 }
 
-/// Validate only the source envelope, not the native/public event schema.
-/// Version/epoch sequencing and public-event classification belong to the source owner.
-pub fn decode_source(data: &[u8]) -> Result<SourceItem, ProtocolError> {
-    // Internally tagged serde enums buffer their contents and lose RawValue's
-    // original lexical representation. Decode the tag, then the selected struct.
-    #[derive(Deserialize)]
-    struct Tag<'a> {
-        #[serde(rename = "type", borrow)]
-        kind: std::borrow::Cow<'a, str>,
+/// Parse only authoritative metadata on an already negotiated scope-v1 stream.
+/// Maps implement native JSON.parse last-key-wins semantics; borrowed raw values
+/// skip unknown payloads without numeric/depth constraints or re-encoding them.
+pub fn decode_event(data: Bytes) -> Result<UpstreamEvent, ProtocolError> {
+    type Object<'a> = HashMap<std::borrow::Cow<'a, str>, &'a RawValue>;
+    fn string(object: &Object<'_>, key: &str) -> Result<String, ProtocolError> {
+        serde_json::from_str(object.get(key).ok_or(ProtocolError::InvalidEvent)?.get())
+            .map_err(ProtocolError::from)
     }
-    #[derive(Deserialize)]
-    struct Ready {
-        version: u32,
-        epoch: String,
-    }
-    #[derive(Deserialize)]
-    struct Event {
-        route: Route,
-        event: Box<RawValue>,
-    }
-    let tag: Tag<'_> = serde_json::from_slice(data)?;
-    let item = match tag.kind.as_ref() {
-        "event-source.ready" => {
-            let Ready { version, epoch } = serde_json::from_slice(data)?;
-            SourceItem::Ready { version, epoch }
+    fn optional(
+        object: &Object<'_>,
+        key: &str,
+        prefix: &str,
+    ) -> Result<Option<String>, ProtocolError> {
+        if !object.contains_key(key) {
+            return Ok(None);
         }
-        "event-source.event" => {
-            let Event { route, event } = serde_json::from_slice(data)?;
-            SourceItem::Event { route, event }
+        let value = string(object, key)?;
+        if !value.starts_with(prefix) {
+            return Err(ProtocolError::InvalidEvent);
         }
-        _ => return Err(ProtocolError::UnknownSourceType),
-    };
-    if let SourceItem::Event { event, .. } = &item
-        && !event.get().starts_with('{')
-    {
+        Ok(Some(value))
+    }
+    let object: Object<'_> = serde_json::from_slice(&data)?;
+    let kind = string(&object, "type")?;
+    if kind == "server.connected" {
+        let epoch = string(&object, "id")?;
+        if !epoch.starts_with("evt_") {
+            return Err(ProtocolError::InvalidEvent);
+        }
+        return Ok(UpstreamEvent::Connected { epoch });
+    }
+    // Controlled transport markers never belong on an ordinary uplink.
+    if kind == "event-feed.ready" {
         return Err(ProtocolError::InvalidEvent);
     }
-    Ok(item)
+    let scope: Object<'_> = serde_json::from_str(
+        object
+            .get("scope")
+            .ok_or(ProtocolError::InvalidEvent)?
+            .get(),
+    )?;
+    let session_id = optional(&scope, "sessionID", "ses")?;
+    if let Some(locations) = scope.get("locations") {
+        let locations: Vec<Object<'_>> = serde_json::from_str(locations.get())?;
+        for location in locations {
+            string(&location, "directory")?;
+            optional(&location, "workspaceID", "wrk")?;
+        }
+    }
+    let route = if STREAMING_TYPES.contains(&kind.as_str()) {
+        Route::Session { session_id }
+    } else {
+        Route::Broadcast
+    };
+    Ok(UpstreamEvent::Domain { route, event: data })
 }
 
 /// Preserve raw JSON whitespace, including pretty-printed objects, as SSE data.
-pub fn event_frame(event: &RawValue) -> Bytes {
-    let raw = event.get().as_bytes();
+pub fn event_frame(raw: &[u8]) -> Bytes {
     let mut frame = Vec::with_capacity(raw.len().saturating_add(8));
     frame.extend_from_slice(b"data: ");
     let mut previous_cr = false;
