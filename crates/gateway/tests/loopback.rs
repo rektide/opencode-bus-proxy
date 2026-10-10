@@ -87,6 +87,15 @@ async fn lifecycle_tracing_uses_only_bounded_redacted_http_metadata() {
         .unwrap();
     assert_eq!(feed.next().await.unwrap()["type"], "server.connected");
     assert_eq!(feed.next().await.unwrap()["id"], "private-event-payload");
+    source
+        .send(Bytes::from_static(
+            b"data: {\"type\":\"event-source.ready\",\"version\":\"private-source-value\",\"epoch\":\"bad\"}\n\n",
+        ))
+        .await
+        .unwrap();
+    assert!(feed.next().await.is_none());
+    // Reconnect starts after the failure category has been logged.
+    let _next_source = harness.sources.recv().await.unwrap();
     drop(feed);
     harness.close().await;
     let captured = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
@@ -96,6 +105,7 @@ async fn lifecycle_tracing_uses_only_bounded_redacted_http_metadata() {
     assert!(captured.contains("http_request"));
     assert!(captured.contains("interests"));
     assert!(captured.contains("forward"));
+    assert!(captured.contains("reason=\"envelope\""));
     for sensitive in [
         &id,
         "ses_private",
@@ -103,6 +113,7 @@ async fn lifecycle_tracing_uses_only_bounded_redacted_http_metadata() {
         "auth_token",
         "private-query-secret",
         "private-event-payload",
+        "private-source-value",
         &STANDARD.encode("opencode:secret"),
     ] {
         assert!(!captured.contains(sensitive), "leaked {sensitive}");

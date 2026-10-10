@@ -261,7 +261,7 @@ async fn source_owner(state: Arc<State>) {
         }
         state.metrics.failures.fetch_add(1, Ordering::Relaxed);
         tracing::warn!(
-            failed = result.is_err(),
+            reason = result.as_ref().err().map_or("closed", |error| error.0),
             "event source disconnected; reconnecting"
         );
         let cap = (250u64.saturating_mul(1 << attempt.min(7))).min(30_000);
@@ -270,11 +270,18 @@ async fn source_owner(state: Arc<State>) {
         tokio::select! { _ = state.shutdown.cancelled() => break, _ = tokio::time::sleep(delay) => {} }
     }
 }
-async fn source_connection(state: &State, epoch: &mut Option<String>) -> Result<(), BoxError> {
+// Only fixed categories leave the source boundary: decoder/HTTP errors can
+// contain peer-supplied values, URLs, or event content and must not enter logs.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct SourceFailure(&'static str);
+
+async fn source_connection(state: &State, epoch: &mut Option<String>) -> Result<(), SourceFailure> {
     let mut request = Request::builder()
         .uri(format!("{}{SOURCE}", state.base))
         .header(header::ACCEPT, "text/event-stream")
-        .body(full(Bytes::new()))?;
+        .body(full(Bytes::new()))
+        .map_err(|_| SourceFailure("request_configuration"))?;
     if let Some(password) = &state.config.password {
         request.headers_mut().insert(
             header::AUTHORIZATION,
@@ -282,25 +289,35 @@ async fn source_connection(state: &State, epoch: &mut Option<String>) -> Result<
                 "Basic {}",
                 STANDARD.encode(format!("{}:{password}", state.config.username))
             )
-            .parse()?,
+            .parse()
+            .map_err(|_| SourceFailure("credential_configuration"))?,
         );
     }
     let response =
-        tokio::time::timeout(state.config.request_timeout, state.client.request(request)).await??;
-    if response.status() != StatusCode::OK
-        || response
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .is_none_or(|v| {
-                !v.split(';')
-                    .next()
-                    .unwrap_or("")
-                    .trim()
-                    .eq_ignore_ascii_case("text/event-stream")
-            })
+        tokio::time::timeout(state.config.request_timeout, state.client.request(request))
+            .await
+            .map_err(|_| SourceFailure("response_timeout"))?
+            .map_err(|_| SourceFailure("connection"))?;
+    if response.status() != StatusCode::OK {
+        tracing::warn!(
+            status = response.status().as_u16(),
+            "source HTTP status rejected"
+        );
+        return Err(SourceFailure("http_status"));
+    }
+    if response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_none_or(|v| {
+            !v.split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .eq_ignore_ascii_case("text/event-stream")
+        })
     {
-        return Err("invalid source response".into());
+        return Err(SourceFailure("content_type"));
     }
     let mut body = response.into_body();
     let mut decoder = SseDecoder::new(state.config.max_source_frame_bytes);
@@ -311,11 +328,22 @@ async fn source_connection(state: &State, epoch: &mut Option<String>) -> Result<
         } else {
             tokio::time::Instant::now() + state.config.source_idle_timeout
         };
-        let Some(frame) = tokio::time::timeout_at(deadline, body.frame()).await? else {
-            decoder.finish()?;
-            return Err("source EOF".into());
+        let Some(frame) = tokio::time::timeout_at(deadline, body.frame())
+            .await
+            .map_err(|_| {
+                SourceFailure(if epoch.is_none() {
+                    "ready_timeout"
+                } else {
+                    "idle_timeout"
+                })
+            })?
+        else {
+            decoder
+                .finish()
+                .map_err(|_| SourceFailure("truncated_frame"))?;
+            return Err(SourceFailure("eof"));
         };
-        let frame = frame?;
+        let frame = frame.map_err(|_| SourceFailure("body_transport"))?;
         let Ok(data) = frame.into_data() else {
             continue;
         };
@@ -325,13 +353,22 @@ async fn source_connection(state: &State, epoch: &mut Option<String>) -> Result<
             .fetch_add(data.len() as u64, Ordering::Relaxed);
         // Chunk slicing prevents one transport chunk from allocating an arbitrarily large decoded batch.
         for chunk in data.chunks(8192) {
-            for data in decoder.push(chunk)? {
-                match bus_proxy_protocol::decode_source(&data)? {
+            for data in decoder
+                .push(chunk)
+                .map_err(|_| SourceFailure("framing_or_size"))?
+            {
+                match bus_proxy_protocol::decode_source(&data)
+                    .map_err(|_| SourceFailure("envelope"))?
+                {
                     SourceItem::Ready {
                         version: 1,
                         epoch: new,
                     } if epoch.is_none() => {
-                        state.router.begin_epoch(new.clone()).await?;
+                        state
+                            .router
+                            .begin_epoch(new.clone())
+                            .await
+                            .map_err(|_| SourceFailure("router_begin"))?;
                         tracing::Span::current().record("epoch", &new);
                         *epoch = Some(new);
                         tracing::info!("event source ready");
@@ -344,10 +381,11 @@ async fn source_connection(state: &State, epoch: &mut Option<String>) -> Result<
                                 route,
                                 bus_proxy_protocol::event_frame(&event),
                             )
-                            .await?;
+                            .await
+                            .map_err(|_| SourceFailure("router_admission"))?;
                         state.metrics.frames.fetch_add(1, Ordering::Relaxed);
                     }
-                    _ => return Err("invalid source readiness sequence".into()),
+                    _ => return Err(SourceFailure("readiness_sequence_or_version")),
                 }
             }
         }
