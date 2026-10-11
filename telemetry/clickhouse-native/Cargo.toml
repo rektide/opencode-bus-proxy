@@ -1,0 +1,22 @@
+[package]
+name = "bus-proxy-clickhouse-native"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+
+[dependencies]
+arrow-array.workspace = true
+clickhouse-arrow = { version = "=0.2.1", default-features = false }
+futures-util.workspace = true
+thiserror.workspace = true
+tokio = { version = "1", default-features = false, features = ["rt", "time", "sync", "net", "macros"] }
+rustls = { version = "0.23", default-features = false }
+
+[dev-dependencies]
+arrow-schema.workspace = true
+futures-executor = "0.3"
+tempfile = "3"
+tracing-subscriber.workspace = true

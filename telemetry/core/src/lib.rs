@@ -39,6 +39,15 @@ impl ProviderConfig {
             .with_span_processor(processor)
             .build()
     }
+
+    /// Caller can add independently bounded processors for several destinations.
+    /// They share this provider's resource, sampling and span policy, not a queue.
+    pub fn builder(self) -> sdk::trace::TracerProviderBuilder {
+        SdkTracerProvider::builder()
+            .with_resource(self.resource)
+            .with_sampler(self.sampler)
+            .with_span_limits(self.span_limits)
+    }
 }
 
 /// Deterministic policy for the ordinary dedicated-thread batch processor.
