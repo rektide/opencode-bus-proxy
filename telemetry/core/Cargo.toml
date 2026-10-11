@@ -1,0 +1,17 @@
+[package]
+name = "bus-proxy-telemetry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+otlp = ["dep:opentelemetry-otlp"]
+
+[dependencies]
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-opentelemetry.workspace = true
+opentelemetry-otlp = { workspace = true, optional = true, features = ["trace", "http-proto", "http-json", "reqwest-blocking-client"] }

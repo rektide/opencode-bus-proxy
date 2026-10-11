@@ -1,5 +1,6 @@
 [workspace]
-members = ["crates/protocol", "crates/router", "crates/gateway", "crates/daemon"]
+members = ["crates/protocol", "crates/router", "crates/gateway", "crates/daemon", "telemetry/core"]
+default-members = ["crates/protocol", "crates/router", "crates/gateway", "crates/daemon"]
 resolver = "2"
 
 [workspace.package]
@@ -11,6 +12,11 @@ license = "MIT"
 bus-proxy-protocol = { path = "crates/protocol" }
 bus-proxy-router = { path = "crates/router" }
 bus-proxy-gateway = { path = "crates/gateway" }
+bus-proxy-telemetry = { path = "telemetry/core", default-features = false }
+opentelemetry = { version = "0.33.1", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["trace"] }
+opentelemetry-otlp = { version = "0.33.1", default-features = false }
+tracing-opentelemetry = { version = "0.34", default-features = false }
 bytes = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }

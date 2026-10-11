@@ -61,7 +61,14 @@ argv or the environment — a hardened production unit preset ships in
 
 ## Inspect
 
-Optional OTLP trace export: set `OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318`.
+Default builds are local-only: no OpenTelemetry SDK, OTLP or exporter HTTP client.
+For optional OTLP trace export, build with
+`cargo build --release --locked -p opencode-bus-proxy --features otlp`, then set
+`OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318`.
+`otel` enables reusable composition without an OTLP backend; it does not make
+OTLP available. Requesting OTLP in a build without `otlp` fails with a rebuild
+instruction, unless explicitly disabled. The library lives in the root
+[`telemetry/core`](telemetry/README.md) domain subtree.
 Collector headers, resource attributes, sampling, batching, and independent export
 filtering are described in [OTLP configuration](doc/event-multiplexer/operations.md#otlp-trace-export).
 
@@ -89,8 +96,10 @@ silently losing frames or holding up other clients.
 | `crates/daemon`   | CLI, tracing, process supervision and shutdown, systemd integration        |
 
 ```sh
-cargo test --workspace --locked
-cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --locked
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --workspace --all-features --locked
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo fmt --all -- --check
 cargo build --locked
 bun run test/compatibility/clients.ts

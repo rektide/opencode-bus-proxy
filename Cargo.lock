@@ -183,6 +183,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "bus-proxy-telemetry"
+version = "0.1.0"
+dependencies = [
+ "opentelemetry",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
+ "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "bytes"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -971,6 +983,7 @@ dependencies = [
  "bus-proxy-gateway",
  "bus-proxy-protocol",
  "bus-proxy-router",
+ "bus-proxy-telemetry",
  "bytes",
  "clap",
  "http",
@@ -978,9 +991,6 @@ dependencies = [
  "hyper",
  "hyper-util",
  "libc",
- "opentelemetry",
- "opentelemetry-otlp",
- "opentelemetry_sdk",
  "reqwest",
  "rustls",
  "serde_json",
@@ -988,7 +998,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
- "tracing-opentelemetry",
  "tracing-subscriber",
 ]
 
