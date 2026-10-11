@@ -70,6 +70,55 @@ browser origins can be supplied with repeatable `--cors` flags.
 This is one shared OpenCode authorization domain; Session interest is a delivery
 preference, not a permission boundary.
 
+## systemd service integration
+
+The daemon runs happily without systemd and picks these up only when the
+service manager provides them:
+
+- **Socket activation** — with `LISTEN_PID`/`LISTEN_FDS` set for this process,
+  the gateway adopts the single `ListenStream=` descriptor systemd duplicated
+  into it and does not bind. An explicit `--listen`/`BUS_PROXY_LISTEN`
+  alongside activation is a configuration error; the socket unit owns the
+  address. Without activation, `--listen` defaults to `127.0.0.1:4097`.
+- **Readiness notification** — `Type=notify` units receive `READY=1` (with the
+  listening address as `STATUS=`) once the gateway accepts connections and
+  `STOPPING=1` when shutdown begins. Readiness means serving; upstream source
+  connection state remains `/_bus/health`'s to report, including its 503 while
+  disconnected.
+- **Watchdog** — `WatchdogSec=` schedules `WATCHDOG=1` heartbeats at half the
+  configured timeout. The watchdog reflects process liveness, not source
+  health; the source supervisor's reconnect backoff can legitimately outlast a
+  tight watchdog budget, so size `WatchdogSec=` for that.
+
+```ini
+# opencode-bus-proxy.socket
+[Socket]
+ListenStream=127.0.0.1:4097
+
+[Install]
+WantedBy=sockets.target
+```
+
+```ini
+# opencode-bus-proxy.service
+[Service]
+Type=notify
+WatchdogSec=30
+ExecStart=/usr/local/bin/opencode-bus-proxy \
+    --upstream http://127.0.0.1:4096 \
+    --credential opencode-password
+LoadCredential=opencode-password:/etc/opencode/server-password
+
+[Install]
+WantedBy=multi-user.target
+```
+
+A socket unit lets the gateway restart without refusing new connections:
+systemd holds the listening socket while the service is down, and queued
+connections survive the restart. Existing streams are live-only and end with
+the process that served them. `systemctl enable --now
+opencode-bus-proxy.socket` starts the service on the first connection.
+
 ## Limits and failure behavior
 
 Use `--help` for current defaults. The configurable limits are:

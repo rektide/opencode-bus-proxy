@@ -50,6 +50,14 @@ explicitly supports an unauthenticated test origin. `--help` lists limits and
 timeouts. A pinned stable toolchain is included; an existing `RUSTUP_TOOLCHAIN`
 environment override takes precedence (use `cargo +1.98.0` to select it explicitly).
 
+The daemon is systemd-aware: socket units hand over the listening socket via
+socket activation (the socket unit's `ListenStream=` owns the address; an
+explicit `--listen` conflicts and is rejected), and `Type=notify` units get
+`READY=1` once serving, `STOPPING=1` at shutdown, and `WatchdogSec=` heartbeats.
+Together with `--credential`, a unit file runs the gateway without secrets in
+argv or the environment — see
+[operations](doc/event-multiplexer/operations.md).
+
 ## Inspect
 
 Authenticated endpoints:
@@ -72,7 +80,7 @@ silently losing frames or holding up other clients.
 | `crates/protocol` | Ordinary scoped events, shared selection contract, control and SSE decoding |
 | `crates/router`   | Session index, atomic interest replacement, bounded queues, epochs          |
 | `crates/gateway`  | Authentication, source lifecycle, HTTP and WebSocket transport              |
-| `crates/daemon`   | CLI, tracing, process supervision and shutdown                              |
+| `crates/daemon`   | CLI, tracing, process supervision and shutdown, systemd integration        |
 
 ```sh
 cargo test --workspace --locked
