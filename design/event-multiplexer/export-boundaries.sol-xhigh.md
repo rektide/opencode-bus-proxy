@@ -16,6 +16,12 @@ built by this pass. Preserve the [custom HTTP draft](clickhouse-http-draft.rs.tx
 unchanged as an uncompiled, unfinished experiment; retaining it does not select
 its schema, configuration, or runtime design.
 
+**Later implementation navigation:** the approved extraction lives at
+`telemetry/core`, and the existing packages now live at
+`components/{protocol,router,gateway}` and `cli/daemon`. The original observations
+and proposed path table below are preserved as proposal evidence; updated source
+links navigate the present layout. No ClickHouse package has been implemented.
+
 ## Recommendation
 
 **Use crates for ownership/reuse boundaries and additive Cargo features for
@@ -67,8 +73,8 @@ observational snapshots, sequenced reactive changes, and frozen restoration
 images. Neither an Arrow stream nor a `SpanExporter` unifies those products.
 
 Concurrent handover work already adds `RouterImage` in
-[`router/src/lib.rs`](../../crates/router/src/lib.rs) and image/transport owners in
-[`gateway/src/handover.rs`](../../crates/gateway/src/handover.rs). This is a
+[`router/src/lib.rs`](../../components/router/src/lib.rs) and image/transport owners in
+[`gateway/src/handover.rs`](../../components/gateway/src/handover.rs). This is a
 working-copy observation, not verification or acceptance of that work. Leave its
 types, freeze/adoption semantics and edits with their owners. An inspection
 adapter must not expose exact image buffers, descriptors, credentials or TLS

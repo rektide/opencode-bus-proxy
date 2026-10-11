@@ -126,7 +126,7 @@ native configured/default origins; forwarded OPTIONS continues to origin.
 
 ## Daemon
 
-Owns `crates/daemon`, root manifest/lockfile, operating docs and integration review.
+Owns `cli/daemon` (formerly `crates/daemon`), root manifest/lockfile, operating docs and integration review.
 CLI binds loopback by default, reads shared credential from an environment or
 file (not password-valued command arguments), exposes queue/source limits and
 JSON tracing, handles SIGINT/SIGTERM, and supervises router/gateway tasks. No live

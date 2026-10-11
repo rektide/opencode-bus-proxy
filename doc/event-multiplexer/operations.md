@@ -321,7 +321,7 @@ configuration. It starts no managed service and executes no model calls. Set
 and Rust copies of `event-scope-v1.json` are identical, and that ordinary clients
 and updated native decoders handle scoped events through the same routes.
 
-The router's release benchmark is in `crates/router/examples/routing_bench.rs`:
+The router's release benchmark is in `components/router/examples/routing_bench.rs`:
 
 ```sh
 cargo run --release --locked -p bus-proxy-router --example routing_bench -- 128 20000 512

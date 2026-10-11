@@ -31,13 +31,13 @@ prove useful seams, not active-client migration or a complete material registry.
 | Gateway `source_connection` | Local decoder, incoming chunks, publication loop | Public snapshot/import API for decoder or established HTTP/TLS transport |
 | Gateway inspections | `/_bus/subscriptions` JSON, `/_bus/metrics` flat counters/gauges, `/_bus/health` readiness | Restoration image or exact ordering between gateway atomics and router observations |
 
-[`Snapshot`](../../crates/router/src/lib.rs) is one actor turn for indexes and
+[`Snapshot`](../../components/router/src/lib.rs) is one actor turn for indexes and
 epoch, but `Queue::recv` reduces individual backlogs concurrently. Its summed
 gauges are sums of per-queue samples, not an atomic global measurement. Gateway
 source metrics use relaxed atomics outside that turn. Preserve those meanings.
 Normal retirement/drop clears queues; reusing shutdown as freeze loses material.
 
-The [tracing test](../../crates/router/tests/tracing.rs) deliberately retains one
+The [tracing test](../../components/router/tests/tracing.rs) deliberately retains one
 subscription span, creates child control spans, and creates **no publication
 spans**. Export work should not undo that property.
 
@@ -289,7 +289,7 @@ behavior. Bound per-material spans by live material limits, cap string lengths,
 avoid session lists/payloads/secrets, remove registry entries on close, and bound
 export queues. Separate metric cardinality limits from tracing-value policy.
 
-The [Rust prototype](../../crates/router/examples/state_exports.rs) creates an
+The [Rust prototype](../../components/router/examples/state_exports.rs) creates an
 export-only retained span and reconciles successive real snapshots into typed
 subscription/membership rows. It emits changed values/events, drops removed rows,
 and asserts cleanup. It is **observed-change reactive**, not a production owner

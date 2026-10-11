@@ -233,7 +233,8 @@ documentation. Preserve earlier design and verification receipts as history.
   exact five-type meaning; conformance pins the set below.
 - The normative machine-readable fixture lives in native Protocol at
   `packages/protocol/fixtures/event-scope-v1.json`. Rust vendors an identical copy
-  at `crates/protocol/fixtures/event-scope-v1.json`; the real cross-repository
+  at `components/protocol/fixtures/event-scope-v1.json` (formerly
+  `crates/protocol/fixtures/event-scope-v1.json`); the real cross-repository
   compatibility check asserts byte equality. The fixture includes the capability
   header/version, focused type list, parsed examples, and raw JSON `wireCases`.
   The raw cases validate the routing-metadata boundary using native JSON.parse /

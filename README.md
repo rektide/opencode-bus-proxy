@@ -88,12 +88,18 @@ silently losing frames or holding up other clients.
 
 ## Layout and verification
 
-| Crate             | Owns                                                                        |
-| ----------------- | --------------------------------------------------------------------------- |
-| `crates/protocol` | Ordinary scoped events, shared selection contract, control and SSE decoding |
-| `crates/router`   | Session index, atomic interest replacement, bounded queues, epochs          |
-| `crates/gateway`  | Authentication, source lifecycle, HTTP and WebSocket transport              |
-| `crates/daemon`   | CLI, tracing, process supervision and shutdown, systemd integration        |
+| Crate                 | Owns                                                                        |
+| --------------------- | --------------------------------------------------------------------------- |
+| `components/protocol` | Ordinary scoped events, shared selection contract, control and SSE decoding |
+| `components/router`   | Session index, atomic interest replacement, bounded queues, epochs          |
+| `components/gateway`  | Authentication, source lifecycle, HTTP and WebSocket transport              |
+| `cli/daemon`          | CLI, tracing, process supervision and shutdown, systemd integration         |
+| `telemetry/core`      | Caller-owned typed telemetry configuration, layers and provider composition |
+
+Package and Rust API names are unchanged. Older design and verification records
+may retain the former `crates/` coordinates; current source navigation uses the
+paths above. The four core packages remain the default workspace members;
+telemetry is selected explicitly by package or daemon feature.
 
 ```sh
 cargo test --locked

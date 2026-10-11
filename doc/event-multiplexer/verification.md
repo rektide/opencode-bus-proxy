@@ -111,7 +111,7 @@ The independent follow-up review found no remaining blocker in those four areas.
 
 ## Performance evidence
 
-The [router benchmark record](../../crates/router/README.md#recorded-verification-2026-10-10)
+The [router benchmark record](../../components/router/README.md#recorded-verification-2026-10-10)
 contains the full command, hardware, compiler, trials, and interpretation. For
 128 clients, 20,000 inputs, and 590-byte encoded frames, three-trial medians were:
 
