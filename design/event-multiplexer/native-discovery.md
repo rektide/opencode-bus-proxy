@@ -1,4 +1,8 @@
-# Proxy-owned native discovery contribution
+# Proxy-owned native discovery contribution — initial predecessor
+
+The initial unchanged-OpenCode constraint below was superseded by user direction
+in the same effort. It is preserved as design provenance, not the current
+operating contract. Current contract: [operations](../../doc/event-multiplexer/operations.md#native-local-discovery).
 
 Direction: ordinary unchanged OpenCode clients must discover the gateway from
 the existing service-local.json slot, without shell URL defaults or OpenCode
@@ -57,3 +61,23 @@ feature line. The maintained contract belongs in this repo's operations docs;
 compfuzor exposes the opt-in only. Tests use isolated registration files and
 mock origins under ~/tmp-opencode. No live registration, service, client, or
 OpenCode build is changed by development or verification.
+
+## Subsequent user direction and resulting adaptation
+
+The user explicitly authorized native publishing override, default-on endpoint
+markup, and named proxy-owned stomp, then requested existing Effect watcher
+reuse. Adapt existing server-reg in its independent owner (not working):
+native --publish-url > OPENCODE_PROXY_URL > listener, additive versioned endpoint
+descriptions, no identity/auth change, managed registrations stay direct.
+Daemon cooperate preserves native contact; explicit stomp reselects the proxy
+after origin publication, including native overrides. Markup is a separate
+default-on choice, not authorization to enable routing globally.
+
+Effect-TS runs in a daemon-supervised Bun invalidation-only child; Rust retains
+all publication/identity/health/restoration ownership. Parent-directory watching
+reuses the existing FileSystemWatchClient and handles atomic saves/removal;
+bounded polling covers disabled/error/standalone deployments. There is no
+origin stomp watcher and no competing owner loop. Finding supplied by FX
+`ses_ed34e6bc3ffenVHwvNdLP7POnL`; effect-watch's accepted boundary remains
+effect-watch-20261011 `65bca58f`, vendor replacement-following primitive already
+available. No new vendor/library patch was required.

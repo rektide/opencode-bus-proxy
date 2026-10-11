@@ -1,3 +1,17 @@
+---
+type: Guide
+title: Operating the event gateway
+description: Gateway topology, native discovery contribution, credentials, lifecycle, bounds and diagnostics.
+resource: https://github.com/rektide/opencode-bus-proxy/blob/main/doc/event-multiplexer/operations.md
+status: maintained
+generated: { by: "human:rektide + model:openai/gpt-6.1-sol", at: 2026-10-11 }
+sources:
+  - { resource: "urn:opencode:session:ses_ed3ebd410ffehOKUhZcNU2hHYk", title: Native discovery, enrichment, stomp and watcher direction }
+  - { resource: "file:///home/rektide/src/opencode-bus-proxy/crates/daemon/src/registration.rs", title: Daemon contribution implementation, 6a9358cb and f232d0da }
+  - { resource: "file:///home/rektide/src/opencode-working/packages/util/src/filesystem-watch-client.ts", title: Reused Effect watcher process owner }
+  - { resource: "file:///home/rektide/src/opencode-server-reg/doc/server-reg/publication.md", title: Native publisher precedence and markup contract }
+---
+
 # Operating the event gateway
 
 ## Topology
@@ -69,6 +83,144 @@ browser origins can be supplied with repeatable `--cors` flags.
 `--allow-unauthenticated` is available for explicitly unauthenticated origins.
 This is one shared OpenCode authorization domain; Session interest is a delivery
 preference, not a permission boundary.
+
+## Native local discovery
+
+`--service-file` / `BUS_PROXY_SERVICE_FILE` opts into contribution to **one
+existing operator-owned OpenCode registration**, e.g. the local channel's
+`$XDG_STATE_HOME/opencode/service-local.json` (normally
+`~/.local/state/opencode/service-local.json`). No path/channel is guessed, and
+an absent record is never invented. This requires the same user/filesystem
+authority as the publisher; the DynamicUser/read-only preset is not suited to
+editing another user's private discovery slot without a deliberate policy.
+
+### Modes and contact precedence
+
+- **cooperate** (default `--service-mode` / `BUS_PROXY_SERVICE_MODE`): supplement
+  endpoint descriptions; leave the publisher's selected `url` unchanged. New
+  server-reg source chooses its contact as explicit `serve --publish-url` >
+  nonempty native `OPENCODE_PROXY_URL` > actual listener. Setting that env on
+  the publisher routes ordinary clients through this daemon without a wrapper.
+- **stomp** (explicit): also replace the eligible origin's selected contact
+  with this gateway's URL and reapply it whenever OpenCode publishes again.
+  This deliberately beats both native explicit and proxy-default contact
+  choices while active; it does **not** overwrite identity or credentials.
+  It supports an older publisher that knows only its bind URL. Only the proxy
+  stomps; there is no origin watcher continually fighting it.
+
+`--service-url` / `BUS_PROXY_SERVICE_URL` overrides the advertised local HTTP
+origin. Otherwise use the actual bound/adopted socket and port, with wildcard
+IPv4/IPv6 mapped to loopback. Upstream stays the independently configured
+BUS_PROXY_UPSTREAM; never read forwarding targets from the contributed slot.
+Native clients authenticate forwarded GET /api/info and require its PID and
+version to match the record: therefore top-level PID/version/id/password
+remain the origin's. The daemon's own PID is descriptive contribution ownership,
+not a pretend OpenCode server identity.
+
+### Default-on markup and eligibility
+
+`--service-metadata true|false` / `BUS_PROXY_SERVICE_METADATA` defaults true
+whenever a service file is selected; it is independent of routing mode. Native
+publication has the analogous default-on `OPENCODE_SERVICE_METADATA` switch.
+Metadata adds no password copy:
+
+```json
+{
+  "mode": "server",
+  "url": "http://127.0.0.1:49372",
+  "pid": 123,
+  "discovery": {
+    "version": 1,
+    "source": "proxy",
+    "endpoints": {
+      "service": { "url": "http://0.0.0.0:49373", "pid": 123 },
+      "proxy": { "url": "http://127.0.0.1:49372", "pid": 456 }
+    }
+  }
+}
+```
+
+The usual version/id/single password and the private `_busProxy` ownership
+marker are omitted from this example. `discovery.source` describes the native
+publisher's preference (or `daemon` for added legacy descriptions), not a
+second contact election. Endpoint names are extensible: unknown compatible
+fields and named endpoints survive contribution. If the publisher describes
+a different proxy, retain it and describe this daemon as `busProxy` instead.
+Stomp still sets the selected top-level URL to this daemon. Cooperative mode
+plus disabled metadata performs no write.
+
+Eligibility requires mode server, the configured local HTTP origin (direct
+URL or version-1 `discovery.endpoints.service`), matching credentials, and a
+forwarded /api/info PID/version match **through the serving gateway**, followed
+by successful /_bus/health. Managed records, unrelated ports/origins, corrupt
+records, unsupported markup, and live foreign contributors are not claimed.
+Origin restarts publish fresh identity; contribution always uses that new
+PID/version/id, not a cached startup record. A changed password is not guessed:
+coordinate the daemon's shared credential/start with the origin.
+
+### Reuse the existing Effect watcher
+
+Rust/Tokio cannot directly execute the Effect-TS watcher. The optional bridge
+is a Bun child **supervised by the daemon**, emitting only ready/change/error
+markers; it never reads or writes record contents. Registration ownership and
+the real proxy PID stay in Rust. Explicitly supply:
+
+```sh
+opencode-bus-proxy --upstream http://127.0.0.1:49373 \
+  --listen 127.0.0.1:49372 --password-file /path/to/shared-password \
+  --service-file /absolute/state/opencode/service-local.json \
+  --service-mode stomp \
+  --service-watch-helper /path/to/opencode-bus-proxy/script/service-watch.ts \
+  --service-watch-source /path/to/opencode-working
+```
+
+Environment counterparts are BUS_PROXY_SERVICE_WATCH_HELPER and
+BUS_PROXY_SERVICE_WATCH_SOURCE. The source root must carry effect-watch's
+`packages/util/src/filesystem-watch-client.ts` and its installed dependencies.
+The helper calls FileSystemWatchClient.create(FileSystemWatch.fromEnvironment),
+watches the **parent directory**, then filters/coalesces the basename. This
+survives temp+rename publication and missing-file recreation without replacing
+the established watcher or vendoring another backend. Native/Watchman backend
+and watcher-disable environment controls remain the existing owner's. No
+OpenCode source composition/build occurs merely by using this helper.
+
+Tradeoff: enabling reuse requires Bun and the selected module checkout. With
+no helper, or while it fails/has been disabled, the daemon polls once per
+second. Failed helpers retry with capped backoff and a fixed warning, without
+logging module/record contents. With an active watcher and an owned record,
+events drive reconciliation plus a 30-second safety reread; while waiting for
+health or a publication, one-second retries continue. Byte-identical own
+writes are quiescent, even if they trigger another watch event. SIGTERM closes
+the helper's Effect scopes, with bounded forced cleanup if necessary.
+
+### Atomicity, shutdown and the single-slot limitation
+
+One adjacent 0600 lock serializes cooperating proxy daemons. Contributions
+use a 0600 same-directory temporary file, sync, final exact-byte reread and
+atomic rename; symlinks and nonregular/oversized records are refused. The
+marker stores contributing PID/token and public restoration details, never a
+credential backup. On graceful shutdown restore only the exact last owned
+record to its predecessor contact/markup. This retains a native publisher's
+explicit proxy choice, or restores an older publisher's direct URL. A changed
+or removed slot is never overwritten on shutdown. A dead contributor can be
+reclaimed after the same origin/health checks; a live one is left alone.
+
+**Check+rename is not compare-and-swap.** Native OpenCode does not take the
+proxy's lock. A native or foreign rename in the narrow final-check/rename
+interval can lose an update. Normal republishing is watched/reapplied; no
+cross-process transactional guarantee is claimed. Removing this residual race
+would need a common publisher protocol or a separate discovery contract.
+
+Compfuzor exposes this as opt-in OPENCODE_BUS_PROXY_DISCOVERY, with default
+cooperative mode and default-on enrichment/watcher reuse. Select stomp
+explicitly for older publication or forced contact policy. Generation, build
+installation, activation and client restart are separate operator actions.
+
+Related homes: [native publisher adaptation](../../../opencode-server-reg/doc/server-reg/publication.md)
+owns OpenCode's selection semantics; [discovery verification](discovery-verification.md)
+records tested properties and activation limits. The
+[additive-event verification](additive-verification.md) remains evidence for
+source delivery; discovery does not replace that transport contract.
 
 ## systemd service integration
 

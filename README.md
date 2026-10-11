@@ -17,6 +17,9 @@ operating instructions; bus-smart also works directly without the gateway.
   from arbitrary payload fields.
 - **Same server URL:** other HTTP requests stream to origin; WebSocket upgrades
   are tunneled for PTYs. Direct bus-smart connections keep working.
+- **Native discovery:** optional daemon-owned endpoint markup, plus explicit
+  `stomp` mode to reapply proxy contact after OpenCode republishes. Origin
+  PID/version/password remain unchanged; no client-shell wrapper is needed.
 
 Requires the additive scoped-event extension implemented in the sibling
 [`opencode-bus-smart`](../opencode-bus-smart/packages/protocol/src/groups/event.ts)
@@ -39,6 +42,15 @@ or a systemd credential named with `--credential` (`BUS_PROXY_CREDENTIAL`).
 Configure clients with the proxy URL and their usual
 credentials. Enable the existing `experimental.session_streaming` client setting
 to use selective delivery. Without that setting, bus-smart clients also broadcast.
+
+For ordinary local clients, configure the new server-reg publisher's native
+`OPENCODE_PROXY_URL`, then opt the daemon into `--service-file <absolute path>`.
+Default `cooperate` mode supplements known endpoints without changing the
+publisher's contact. Explicit `--service-mode stomp` also redirects an eligible
+origin record after every publication, including older publishers. Enrichment
+is default-on independently of that routing choice. See
+[native discovery](doc/event-multiplexer/operations.md#native-local-discovery)
+for the reused Effect watcher bridge, ownership and restoration boundaries.
 
 ```sh
 RUST_LOG=info,bus_proxy_gateway=debug target/release/opencode-bus-proxy \
@@ -89,12 +101,17 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo fmt --all -- --check
 cargo build --locked
 bun run test/compatibility/clients.ts
+bun run test/compatibility/discovery.ts
 ```
 
 The final check requires the sibling bus-smart checkout and installed Bun
 dependencies. It checks the shared contract fixtures match, creates an isolated
 in-memory origin, and exercises its real Bus, ordinary HTTP stream, and unchanged
 client/controller code against the compiled proxy.
+The discovery check additionally needs the sibling server-reg source adaptation
+and working's existing effect-watch modules; it exercises both unchanged native
+client styles, publisher cooperation, stomp and real parent-directory watching
+using isolated mock origins/records, never the live registration.
 
 See [operations](doc/event-multiplexer/operations.md),
 [current verification](doc/event-multiplexer/additive-verification.md),
