@@ -524,6 +524,9 @@ async fn drive_source(owner: &mut SourceOwner, state: &State) -> Result<(), Sour
                             .await
                             .map_err(|_| SourceFailure("router_begin"))?;
                         owner.image.epoch = Some(epoch);
+                        tracing::Span::current()
+                            .record("epoch", owner.image.epoch.as_deref().unwrap());
+                        tracing::info!("event source ready");
                         state.source_ready.store(true, Ordering::Release);
                     }
                     UpstreamEvent::Domain { route, event } if owner.image.epoch.is_some() => {
@@ -593,6 +596,9 @@ pub(crate) async fn source(
         let (result, parked) = async {
             match connected {
                 Ok(mut owner) => {
+                    if let Some(epoch) = &owner.image.epoch {
+                        tracing::Span::current().record("epoch", epoch);
+                    }
                     state
                         .source_ready
                         .store(owner.image.epoch.is_some(), Ordering::Release);
@@ -644,6 +650,61 @@ pub(crate) async fn source(
             _ = state.pause.cancelled() => return None,
             _ = state.shutdown.cancelled() => return None,
             _ = tokio::time::sleep(Duration::from_millis(rand::random_range(cap / 2..=cap))) => {},
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn drain(framing: &mut Framing, buffer: &mut Vec<u8>, output: &mut Vec<u8>) {
+        loop {
+            match framing.take(buffer) {
+                Ok(Some(bytes)) => output.extend_from_slice(&bytes),
+                Ok(None) => break,
+                Err(SourceFailure("eof")) => break,
+                Err(error) => panic!("unexpected framing error: {error}"),
+            }
+        }
+    }
+
+    #[test]
+    fn every_http_chunk_cut_restores_header_data_crlf_and_trailers_without_replay() {
+        let mut wire =
+            b"3;extension=ok\r\none\r\n3\r\ntwo\r\n0\r\nignored: trailer\r\n\r\n".to_vec();
+        // Chunk syntax is HTTP material, independent of SSE decoder boundaries.
+        for cut in 0..=wire.len() {
+            let mut old = Framing::Chunked(ChunkPhase::Size);
+            let mut buffer = wire[..cut].to_vec();
+            let mut output = Vec::new();
+            drain(&mut old, &mut buffer, &mut output);
+            let mut successor: Framing =
+                serde_json::from_slice(&serde_json::to_vec(&old).unwrap()).unwrap();
+            buffer.extend_from_slice(&wire[cut..]);
+            drain(&mut successor, &mut buffer, &mut output);
+            assert_eq!(output, b"onetwo", "cut {cut}");
+            assert!(buffer.is_empty());
+            assert!(matches!(successor, Framing::Chunked(ChunkPhase::Done)));
+        }
+        wire.clear();
+        assert!(!Framing::Chunked(ChunkPhase::CrLf(2)).valid());
+        assert!(!Framing::Chunked(ChunkPhase::Data(0)).valid());
+    }
+
+    #[test]
+    fn fixed_length_and_close_delimited_body_buffers_resume_exactly() {
+        for framing in [Framing::Length(6), Framing::Close] {
+            let mut old = framing;
+            let mut buffer = b"one".to_vec();
+            let mut output = Vec::new();
+            drain(&mut old, &mut buffer, &mut output);
+            let mut successor: Framing =
+                serde_json::from_slice(&serde_json::to_vec(&old).unwrap()).unwrap();
+            buffer.extend_from_slice(b"two");
+            drain(&mut successor, &mut buffer, &mut output);
+            assert_eq!(output, b"onetwo");
+            assert!(buffer.is_empty());
         }
     }
 }

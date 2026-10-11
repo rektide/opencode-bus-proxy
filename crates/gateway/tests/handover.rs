@@ -169,8 +169,57 @@ async fn established_responses_and_live_only_source_survive_two_successors_and_a
     assert_eq!(active.next().await["id"], "before");
     assert_eq!(legacy.next().await["id"], "before");
 
+    // Unsupported connections are deliberately failed at the cut, never fed
+    // back into a new Hyper parser as though their TCP stream were fresh HTTP.
+    let mut idle_headers = TcpStream::connect(address).await.unwrap();
+    idle_headers.write_all(b"GET /unfinished ").await.unwrap();
+    let mut ordinary = TcpStream::connect(address).await.unwrap();
+    ordinary
+        .write_all(format!("GET /long-operation HTTP/1.1\r\nHost: {address}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let (mut ordinary_origin, _) = origin.accept().await.unwrap();
+    let mut request = Vec::new();
+    while !request.ends_with(b"\r\n\r\n") {
+        request.push(ordinary_origin.read_u8().await.unwrap());
+    }
+    let mut tunnel = TcpStream::connect(address).await.unwrap();
+    tunnel.write_all(format!("GET /upgrade HTTP/1.1\r\nHost: {address}\r\nConnection: upgrade\r\nUpgrade: echo\r\n\r\n").as_bytes()).await.unwrap();
+    let (mut tunnel_origin, _) = origin.accept().await.unwrap();
+    let mut request = Vec::new();
+    while !request.ends_with(b"\r\n\r\n") {
+        request.push(tunnel_origin.read_u8().await.unwrap());
+    }
+    tunnel_origin
+        .write_all(
+            b"HTTP/1.1 101 Switching Protocols\r\nConnection: upgrade\r\nUpgrade: echo\r\n\r\n",
+        )
+        .await
+        .unwrap();
+    let mut reply = Vec::new();
+    while !reply.ends_with(b"\r\n\r\n") {
+        reply.push(tunnel.read_u8().await.unwrap());
+    }
+    assert!(reply.starts_with(b"HTTP/1.1 101"));
+    tunnel.write_all(b"ping").await.unwrap();
+    let mut ping = [0; 4];
+    tunnel_origin.read_exact(&mut ping).await.unwrap();
+    assert_eq!(&ping, b"ping");
+
     // Failed preparation resumes the same owners and never retires the epoch.
     let frozen = control.freeze().await.unwrap();
+    for socket in [&mut idle_headers, &mut ordinary, &mut tunnel] {
+        let mut bytes = [0; 32];
+        let closed = tokio::time::timeout(Duration::from_secs(2), socket.read(&mut bytes))
+            .await
+            .unwrap();
+        assert!(
+            matches!(closed, Ok(0) | Err(_)),
+            "unsupported connection was explicitly closed"
+        );
+    }
+    drop(ordinary_origin);
+    drop(tunnel_origin);
     control.resume(frozen).await.unwrap();
     source
         .write_all(&chunk(&event("ses_a", "after-abort")))

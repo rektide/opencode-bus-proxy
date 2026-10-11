@@ -319,6 +319,24 @@ mod tests {
     }
 
     #[test]
+    fn descriptor_identity_follows_names_not_numbers_and_rejects_ambiguity() {
+        assert_eq!(
+            descriptor_names(3, Some("bp-g-source:listener:bp-g-manifest")).unwrap(),
+            ["bp-g-source", "listener", "bp-g-manifest"]
+        );
+        assert_eq!(descriptor_names(1, None).unwrap(), ["listener"]);
+        for names in [
+            None,
+            Some("listener:listener"),
+            Some("listener"),
+            Some("listener:bad\nname"),
+            Some("listener:"),
+        ] {
+            assert!(descriptor_names(2, names).is_err());
+        }
+    }
+
+    #[test]
     fn adopted_listeners_report_their_bound_address() {
         let bound = TcpListener::bind("127.0.0.1:0").expect("bind");
         let expected = bound.local_addr().unwrap();

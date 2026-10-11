@@ -565,39 +565,40 @@ async fn handle(mut request: Request<Incoming>, state: Arc<State>) -> Response<B
         }
     } else if request.method() == Method::GET && path.starts_with("/_bus/") {
         if path == "/_bus/handover" {
-            return json(StatusCode::OK, state.registry.inspect(&state));
-        }
-        match state.router.snapshot().await {
-            Ok(snapshot) => {
-                let value = serde_json::to_value(snapshot).unwrap();
-                match path {
-                    "/_bus/health" => json(
-                        if value["epoch"].is_string() {
-                            StatusCode::OK
-                        } else {
-                            StatusCode::SERVICE_UNAVAILABLE
-                        },
-                        serde_json::json!({"ready":value["epoch"].is_string()}),
-                    ),
-                    "/_bus/subscriptions" => json(StatusCode::OK, value),
-                    "/_bus/metrics" => {
-                        let mut text = format!(
-                            "bus_proxy_ready {}\nbus_proxy_source_frames_total {}\nbus_proxy_source_bytes_total {}\nbus_proxy_source_failures_total {}\n",
-                            u8::from(value["epoch"].is_string()),
-                            state.metrics.frames.load(Ordering::Relaxed),
-                            state.metrics.bytes.load(Ordering::Relaxed),
-                            state.metrics.failures.load(Ordering::Relaxed)
-                        );
-                        metric_numbers("bus_proxy_router", &value, &mut text);
-                        Response::builder()
-                            .header(header::CONTENT_TYPE, "text/plain; version=0.0.4")
-                            .body(full(text))
-                            .unwrap()
+            json(StatusCode::OK, state.registry.inspect(&state))
+        } else {
+            match state.router.snapshot().await {
+                Ok(snapshot) => {
+                    let value = serde_json::to_value(snapshot).unwrap();
+                    match path {
+                        "/_bus/health" => json(
+                            if value["epoch"].is_string() {
+                                StatusCode::OK
+                            } else {
+                                StatusCode::SERVICE_UNAVAILABLE
+                            },
+                            serde_json::json!({"ready":value["epoch"].is_string()}),
+                        ),
+                        "/_bus/subscriptions" => json(StatusCode::OK, value),
+                        "/_bus/metrics" => {
+                            let mut text = format!(
+                                "bus_proxy_ready {}\nbus_proxy_source_frames_total {}\nbus_proxy_source_bytes_total {}\nbus_proxy_source_failures_total {}\n",
+                                u8::from(value["epoch"].is_string()),
+                                state.metrics.frames.load(Ordering::Relaxed),
+                                state.metrics.bytes.load(Ordering::Relaxed),
+                                state.metrics.failures.load(Ordering::Relaxed)
+                            );
+                            metric_numbers("bus_proxy_router", &value, &mut text);
+                            Response::builder()
+                                .header(header::CONTENT_TYPE, "text/plain; version=0.0.4")
+                                .body(full(text))
+                                .unwrap()
+                        }
+                        _ => failure(StatusCode::NOT_FOUND, "Not found"),
                     }
-                    _ => failure(StatusCode::NOT_FOUND, "Not found"),
                 }
+                Err(error) => router_error(error, ""),
             }
-            Err(error) => router_error(error, ""),
         }
     } else {
         failure(StatusCode::NOT_FOUND, "Not found")
