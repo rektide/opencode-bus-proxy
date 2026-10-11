@@ -499,11 +499,21 @@ async fn handle(mut request: Request<Incoming>, state: Arc<State>) -> Response<B
             Ok(subscription) => {
                 let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
                 heartbeat.tick().await;
-                let stream = futures_util::stream::unfold(
+                let stream = futures_util::stream::try_unfold(
                     (subscription, heartbeat, state.shutdown.clone()),
                     |(mut sub, mut beat, stop)| async move {
-                        let bytes = tokio::select! { biased; _ = stop.cancelled() => return None, value = sub.recv() => value?, _ = beat.tick() => Bytes::from_static(b": heartbeat\n\n") };
-                        Some((Ok::<_, BoxError>(Frame::data(bytes)), (sub, beat, stop)))
+                        let bytes = tokio::select! {
+                            biased;
+                            _ = stop.cancelled() => return Ok(None),
+                            value = sub.recv() => value.ok_or_else(|| -> BoxError {
+                                // A live-only feed cannot complete successfully: retirement
+                                // means the client must reconnect and refresh. A clean HTTP
+                                // EOF can instead terminate an async iterator without retry.
+                                std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Event subscription retired").into()
+                            })?,
+                            _ = beat.tick() => Bytes::from_static(b": heartbeat\n\n"),
+                        };
+                        Ok::<_, BoxError>(Some((Frame::data(bytes), (sub, beat, stop))))
                     },
                 );
                 Response::builder()

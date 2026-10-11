@@ -175,6 +175,15 @@ The handoff is best-effort: without a service manager it is a no-op, and a
 failed store only means restarts rebind with a brief refused window — logged
 at debug, never fatal.
 
+The store currently preserves only the listener, not accepted client connections.
+Active-client handoff for uninterrupted proxy upgrades is a future direction:
+it needs a quiesced handoff boundary, versioned subscription/queue state, and
+ownership transfer of each socket together with HTTP framing and buffered bytes.
+Duplicating a socket into fdstore alone does not preserve Hyper's connection
+state. In-flight HTTP requests and upgraded tunnels also need an explicit
+handoff strategy. Origin restarts still require client refresh because the event
+source is live-only; preserving a downstream socket cannot recover missed events.
+
 ## Limits and failure behavior
 
 Use `--help` for current defaults. The configurable limits are:
@@ -205,6 +214,12 @@ memberships. Source EOF, bad framing/scope, missing or unsupported capability, a
 idle failure invalidate the whole source epoch and all attached subscription IDs.
 Queued old-epoch events are discarded. Bytes already handed to the network cannot
 be recalled. One reconnect loop establishes a new source epoch with capped backoff.
+Retired SSE responses fail at the HTTP body boundary, closing their connections
+without a successful chunked-response terminator. This exposes the outage to
+error-driven client retry loops rather than silently completing their iterators.
+Fresh subscriptions receive 503 until the source is ready; clients must retry
+those responses too, re-register interests, and refresh their snapshots. The
+proxy stays running through an origin outage.
 There is no hidden failover, persistent replay, or exactly-once delivery.
 
 Interest replacement is atomic at **proxy admission**. Already queued downstream

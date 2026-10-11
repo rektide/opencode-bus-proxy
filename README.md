@@ -69,7 +69,8 @@ Authenticated endpoints:
 | `/_bus/subscriptions` | Which live subscriptions are legacy/pending/active, which Sessions they follow, and their queue pressure. |
 | `/_bus/metrics`       | Prometheus counters and gauges for source traffic and routing admissions.                                 |
 
-Source failure closes downstream streams and invalidates subscription IDs.
+Source failure aborts downstream SSE responses with a transport error and
+invalidates subscription IDs; it does not report successful stream completion.
 Clients reconnect and refresh through their existing connection logic. Streams
 are live-only; there is no replay. A slow subscriber is disconnected rather than
 silently losing frames or holding up other clients.

@@ -93,7 +93,7 @@ async fn lifecycle_tracing_uses_only_bounded_redacted_http_metadata() {
         ))
         .await
         .unwrap();
-    assert!(feed.next().await.is_none());
+    assert!(feed.aborted().await);
     // Reconnect starts after the failure category has been logged.
     let _next_source = harness.sources.recv().await.unwrap();
     drop(feed);
@@ -503,6 +503,15 @@ struct Feed {
     pending: std::collections::VecDeque<Vec<u8>>,
 }
 impl Feed {
+    async fn aborted(&mut self) -> bool {
+        assert!(self.pending.is_empty(), "unexpected queued events");
+        matches!(
+            tokio::time::timeout(Duration::from_secs(3), self.body.frame())
+                .await
+                .unwrap(),
+            Some(Err(_))
+        )
+    }
     async fn next(&mut self) -> Option<serde_json::Value> {
         self.next_raw()
             .await
@@ -570,9 +579,9 @@ async fn selection_outage_reconnect_and_stale_ids() {
     assert_eq!(legacy.next().await.unwrap()["id"], "a");
     assert_eq!(legacy.next().await.unwrap()["id"], "broad");
     drop(source);
-    assert!(a.next().await.is_none());
-    assert!(b.next().await.is_none());
-    assert!(legacy.next().await.is_none());
+    assert!(a.aborted().await);
+    assert!(b.aborted().await);
+    assert!(legacy.aborted().await);
     let source2 = harness.sources.recv().await.unwrap();
     harness.ready().await;
     assert_eq!(harness.interest(&aid, "ses_a").await, 404);
@@ -748,6 +757,56 @@ async fn streaming_forwarding_cookie_auth_cors_and_raw_upgrade() {
 }
 
 #[tokio::test]
+async fn source_bounce_aborts_both_feeds_and_accepts_fresh_subscriptions() {
+    let mut harness = Harness::new().await;
+    let source = harness.sources.recv().await.unwrap();
+    harness.ready().await;
+    let mut legacy = harness.feed(false).await;
+    legacy.next().await.unwrap();
+    let mut controlled = harness.feed(true).await;
+    let id = controlled.next().await.unwrap()["data"]["subscriptionID"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(harness.interest(&id, "ses_a").await, 204);
+    controlled.next().await.unwrap();
+
+    // Even a graceful origin EOF must become a transport error downstream,
+    // not successful iterator completion that can bypass clients' retries.
+    drop(source);
+    for feed in [&mut legacy, &mut controlled] {
+        let frame = tokio::time::timeout(Duration::from_secs(2), feed.body.frame())
+            .await
+            .unwrap();
+        assert!(matches!(frame, Some(Err(_))), "feed ended cleanly");
+    }
+    assert_eq!(harness.interest(&id, "ses_a").await, 404);
+
+    let source = tokio::time::timeout(Duration::from_secs(2), harness.sources.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    harness.ready().await;
+    let mut legacy = harness.feed(false).await;
+    legacy.next().await.unwrap();
+    let mut controlled = harness.feed(true).await;
+    let new_id = controlled.next().await.unwrap()["data"]["subscriptionID"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(id, new_id);
+    assert_eq!(harness.interest(&new_id, "ses_a").await, 204);
+    controlled.next().await.unwrap();
+    source
+        .send(event("broadcast", None, "after-bounce"))
+        .await
+        .unwrap();
+    assert_eq!(legacy.next().await.unwrap()["id"], "after-bounce");
+    assert_eq!(controlled.next().await.unwrap()["id"], "after-bounce");
+    harness.close().await;
+}
+
+#[tokio::test]
 async fn invalid_source_and_idle_timeout_end_downstream() {
     let mut harness = Harness::new().await;
     let source = harness.sources.recv().await.unwrap();
@@ -760,7 +819,7 @@ async fn invalid_source_and_idle_timeout_end_downstream() {
         ))
         .await
         .unwrap();
-    assert!(feed.next().await.is_none());
+    assert!(feed.aborted().await);
     let source = harness.sources.recv().await.unwrap();
     harness.ready().await;
     let mut feed = harness.feed(false).await;
@@ -769,7 +828,7 @@ async fn invalid_source_and_idle_timeout_end_downstream() {
         .send(Bytes::from_static(b"data: not json\n\n"))
         .await
         .unwrap();
-    assert!(feed.next().await.is_none());
+    assert!(feed.aborted().await);
     let _source = harness.sources.recv().await.unwrap();
     harness.ready().await;
     let mut feed = harness.feed(false).await;
@@ -779,7 +838,7 @@ async fn invalid_source_and_idle_timeout_end_downstream() {
         .await
         .unwrap();
     assert!(
-        feed.next().await.is_none(),
+        feed.aborted().await,
         "oversized source frame must retire the epoch"
     );
     let _source = harness.sources.recv().await.unwrap();
@@ -787,7 +846,7 @@ async fn invalid_source_and_idle_timeout_end_downstream() {
     let mut feed = harness.feed(false).await;
     feed.next().await.unwrap();
     assert!(
-        feed.next().await.is_none(),
+        feed.aborted().await,
         "silent source must not survive with local heartbeats"
     );
     harness.close().await;
@@ -845,7 +904,7 @@ async fn malformed_scope_and_truncated_data_retire_live_epoch() {
             .await
             .unwrap();
         drop(source);
-        assert!(feed.next().await.is_none());
+        assert!(feed.aborted().await);
         harness.close().await;
     }
 }
@@ -932,7 +991,7 @@ async fn whole_json_and_scope_survive_proxy_chain_with_authoritative_selection()
     assert_eq!(feed.next_raw().await.unwrap(), broad);
     drop(source);
     assert!(
-        feed.next().await.is_none(),
+        feed.aborted().await,
         "origin gap invalidates both proxy generations"
     );
     stop.cancel();
