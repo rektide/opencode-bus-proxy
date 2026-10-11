@@ -176,6 +176,8 @@ failed store only means restarts rebind with a brief refused window — logged
 at debug, never fatal.
 
 The store currently preserves only the listener, not accepted client connections.
+The proposed [active-client handoff registry](../../design/event-multiplexer/active-client-handoff.md)
+inventories the descriptors, subscription state, buffers and transfer boundaries.
 Active-client handoff for uninterrupted proxy upgrades is a future direction:
 it needs a quiesced handoff boundary, versioned subscription/queue state, and
 ownership transfer of each socket together with HTTP framing and buffered bytes.
