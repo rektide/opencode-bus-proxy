@@ -256,4 +256,29 @@ import above a lowered target, and granted delivery import. See the
   authentication, HTTP forwarding, and legacy/native client checks.
 - `systemd-analyze verify` passed the repository's existing service/socket preset;
   unrelated host-unit deprecation/permission warnings were emitted. The opt-in
-  drop-in is an installation example, not a live configuration change.
+   drop-in is an installation example, not a live configuration change.
+
+### Installed user-service demonstration — 2026-10-11
+
+Session `ses_ed3b65203ffebXKv17uH4LiZrB` installed the tested optimized binary
+by atomic replacement of the existing executable path and enabled the user-service
+drop-in at `~/.config/systemd/user/opencode-bus-proxy.service.d/handover.conf`.
+Existing origin `127.0.0.1:49373`, listener `127.0.0.1:49372`, and password-file
+configuration were retained. One ordinary bootstrap restart enabled notification
+and listener storage; health then returned 200 and the store held one FD.
+
+A subsequent SIGUSR2 reset in **buffered** mode replaced PID 3776832 with
+3797409. A legacy and an activated controlled test response remained open across
+the replacement and received later heartbeat comments without reconnecting.
+Both downstream socket inodes and the origin source socket inode were identical
+before and after. An interest PUT using the original controlled subscription ID
+succeeded after replacement. Progress reported `kept=2`, `dropped=0`,
+`phase=running`; transient descriptors were consumed, leaving one stored listener.
+The runtime frame target remained 4096 throughout.
+
+This live check exercised response continuity and a surviving control operation;
+it did not inject application events or dial the shared service's queue to zero.
+Boundary-mode and zero-target preservation have the isolated systemd evidence
+above. The deployment probe is retained at
+`/home/rektide/tmp-opencode/silent-cactus-live-handover.py`, and the pre-bootstrap
+executable at `/home/rektide/tmp-opencode/silent-cactus-obp-pre-handover`.
