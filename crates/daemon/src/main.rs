@@ -7,6 +7,8 @@ use tokio::{net::TcpListener, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
+mod systemd;
+
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
 /// A subscription-aware OpenCode V2 event gateway.
@@ -21,8 +23,10 @@ struct Arguments {
     )]
     upstream: String,
 
-    #[arg(long, env = "BUS_PROXY_LISTEN", default_value = "127.0.0.1:4097")]
-    listen: SocketAddr,
+    /// Bind address; defaults to 127.0.0.1:4097. Under systemd socket
+    /// activation the ListenStream= socket unit owns the address instead.
+    #[arg(long, env = "BUS_PROXY_LISTEN")]
+    listen: Option<SocketAddr>,
 
     #[arg(long, env = "OPENCODE_SERVER_USERNAME", default_value = "opencode")]
     username: String,
@@ -130,7 +134,29 @@ async fn main() -> Result<()> {
         max_connections: args.max_connections,
         header_read_timeout: Duration::from_secs(args.header_read_seconds as u64),
     };
-    let listener = TcpListener::bind(args.listen).await?;
+    let activation = systemd::requested(
+        std::env::var("LISTEN_PID").ok().as_deref(),
+        std::env::var("LISTEN_FDS").ok().as_deref(),
+        std::process::id(),
+    )?;
+    let listener = if activation {
+        if let Some(address) = args.listen {
+            return Err(format!(
+                "--listen {address} conflicts with systemd socket activation; \
+                 the socket unit's ListenStream= owns the bind address"
+            )
+            .into());
+        }
+        let (listener, address) = systemd::adopt(systemd::activated_fd())?;
+        tracing::info!(%address, "listener adopted from systemd socket activation");
+        remove_activation_environment();
+        TcpListener::from_std(listener)?
+    } else {
+        let address = args
+            .listen
+            .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 4097)));
+        TcpListener::bind(address).await?
+    };
     let address = listener.local_addr()?;
     let shutdown = CancellationToken::new();
     let (router, mut routing) = Router::spawn(limits, shutdown.clone())?;
@@ -236,6 +262,18 @@ fn credential_path(name: &str, directory: Option<&std::ffi::OsStr>) -> Result<Pa
         )
     })?;
     Ok(PathBuf::from(directory).join(name))
+}
+
+/// sd_listen_fds(3) hands the activation environment to this process only;
+/// consuming it keeps any future child from re-adopting the descriptors.
+fn remove_activation_environment() {
+    // SAFETY: startup runs on the main thread before tasks are spawned, so no
+    // concurrent reader of the environment exists.
+    unsafe {
+        std::env::remove_var("LISTEN_FDS");
+        std::env::remove_var("LISTEN_PID");
+        std::env::remove_var("LISTEN_FDNAMES");
+    }
 }
 
 async fn join_shutdown<T>(task: &mut JoinHandle<T>) -> Result<T> {
