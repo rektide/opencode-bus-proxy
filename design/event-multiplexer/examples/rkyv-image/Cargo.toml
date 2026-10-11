@@ -1,0 +1,11 @@
+[package]
+name = "handover-image-prototype"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Intentionally isolated: no production workspace dependency changes.
+[workspace]
+
+[dependencies]
+rkyv = { version = "=0.8.18", features = ["little_endian", "aligned", "pointer_width_64"] }
