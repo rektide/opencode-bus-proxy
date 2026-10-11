@@ -17,31 +17,6 @@ pub struct DecoderImage {
     started: bool,
 }
 
-#[cfg(test)]
-mod handover_tests {
-    use super::*;
-
-    #[test]
-    fn every_cut_preserves_bom_crlf_and_partial_data() {
-        let wire = b"\xef\xbb\xbfdata: first\r\ndata: second\r\n\r\n: beat\r\ndata: third\n\n";
-        for cut in 0..=wire.len() {
-            let mut old = SseDecoder::new(1024);
-            let mut frames = old.push(&wire[..cut]).unwrap();
-            let image =
-                serde_json::from_slice(&serde_json::to_vec(&old.export().unwrap()).unwrap())
-                    .unwrap();
-            let mut new = SseDecoder::import(image, 1024).unwrap();
-            frames.extend(new.push(&wire[cut..]).unwrap());
-            new.finish().unwrap();
-            assert_eq!(
-                frames,
-                [b"first\nsecond".to_vec(), b"third".to_vec()],
-                "cut {cut}"
-            );
-        }
-    }
-}
-
 /// Incremental SSE data decoder. Each byte is visited a constant number of times,
 /// even for one-byte input chunks. The bound counts all non-CR/LF bytes between
 /// blank lines, including field prefixes/comments; a leading UTF-8 BOM is exempt.
@@ -217,5 +192,30 @@ impl SseDecoder {
         self.line.clear();
         self.data.clear();
         Err(error)
+    }
+}
+
+#[cfg(test)]
+mod handover_tests {
+    use super::*;
+
+    #[test]
+    fn every_cut_preserves_bom_crlf_and_partial_data() {
+        let wire = b"\xef\xbb\xbfdata: first\r\ndata: second\r\n\r\n: beat\r\ndata: third\n\n";
+        for cut in 0..=wire.len() {
+            let mut old = SseDecoder::new(1024);
+            let mut frames = old.push(&wire[..cut]).unwrap();
+            let image =
+                serde_json::from_slice(&serde_json::to_vec(&old.export().unwrap()).unwrap())
+                    .unwrap();
+            let mut new = SseDecoder::import(image, 1024).unwrap();
+            frames.extend(new.push(&wire[cut..]).unwrap());
+            new.finish().unwrap();
+            assert_eq!(
+                frames,
+                [b"first\nsecond".to_vec(), b"third".to_vec()],
+                "cut {cut}"
+            );
+        }
     }
 }

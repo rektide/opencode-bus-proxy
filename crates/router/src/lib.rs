@@ -196,7 +196,7 @@ impl Queue {
                 closed: false,
             }),
             notify: Notify::new(),
-            canceled: CancellationToken::new(),
+            canceled: epoch_canceled.child_token(),
             epoch_canceled,
             max_frames: limits.queue_frames,
             max_bytes: limits.queue_bytes,
@@ -279,6 +279,10 @@ pub struct Subscription {
 impl Subscription {
     pub fn id(&self) -> &str {
         &self.id
+    }
+
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.queue.canceled.clone()
     }
 
     /// Cancel-safe dequeue. No frame is yielded after observing cancellation;
@@ -979,14 +983,13 @@ mod tests {
         let image: RouterImage =
             serde_json::from_slice(&serde_json::to_vec(&image).unwrap()).unwrap();
         let limits = image.limits.clone();
-        assert_eq!(
-            image
+        assert!(
+            !image
                 .subscriptions
                 .iter()
                 .find(|s| s.id == pending.id())
                 .unwrap()
-                .active,
-            false
+                .active
         );
         // Real transport owners park their guards; no normal drop before export.
         active.relinquish();

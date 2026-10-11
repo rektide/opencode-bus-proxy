@@ -1,5 +1,7 @@
 //! Same-origin HTTP gateway and sole routed-event source owner.
 mod auth;
+pub mod handover;
+mod transport;
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use bus_proxy_protocol::{
@@ -28,7 +30,6 @@ use std::{
 use tokio::{
     net::TcpListener,
     sync::{OwnedSemaphorePermit, Semaphore},
-    task::JoinSet,
 };
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::Instrument;
@@ -92,6 +93,9 @@ struct State {
     shutdown: CancellationToken,
     tasks: TaskTracker,
     metrics: Metrics,
+    pause: CancellationToken,
+    source_ready: std::sync::atomic::AtomicBool,
+    registry: handover::Registry,
 }
 
 fn full(value: impl Into<Bytes>) -> Body {
@@ -115,6 +119,25 @@ pub async fn serve(
     config: Config,
     router: Router,
     shutdown: CancellationToken,
+) -> Result<(), GatewayError> {
+    serve_with_handover(
+        listener,
+        config,
+        router,
+        shutdown,
+        handover::channel().1,
+        None,
+    )
+    .await
+}
+
+pub async fn serve_with_handover(
+    listener: TcpListener,
+    config: Config,
+    router: Router,
+    shutdown: CancellationToken,
+    control: handover::Receiver,
+    imported: Option<handover::Imported>,
 ) -> Result<(), GatewayError> {
     let url = url::Url::parse(&config.upstream)
         .map_err(|_| GatewayError::Configuration("upstream URL"))?;
@@ -174,67 +197,42 @@ pub async fn serve(
         shutdown: stop.clone(),
         tasks: TaskTracker::new(),
         metrics: Metrics::default(),
+        pause: CancellationToken::new(),
+        source_ready: std::sync::atomic::AtomicBool::new(false),
+        registry: handover::Registry::default(),
     });
-    let mut source = tokio::spawn(source_owner(state.clone()));
-    let mut connections = JoinSet::new();
-    let permits = Arc::new(Semaphore::new(state.config.max_connections));
-    let result = loop {
-        tokio::select! {
-            biased;
-            _ = shutdown.cancelled() => break Ok(()),
-            result = &mut source => break result.map_err(GatewayError::SourceTask),
-            Some(_) = connections.join_next(), if !connections.is_empty() => {},
-            accepted = async {
-                let permit = permits.clone().acquire_owned().await.expect("connection semaphore stays open");
-                listener.accept().await.map(|(socket, _)| (socket, Arc::new(permit)))
-            } => {
-                let (socket, permit) = match accepted { Ok(v) => v, Err(e) => break Err(GatewayError::Listener(e)) };
-                let state = state.clone();
-                connections.spawn(async move {
-                    let service_state = state.clone();
-                    let service_permit = permit.clone();
-                    let service = service_fn(move |mut request: Request<Incoming>| {
-                        // The upgrade task takes this lease before Hyper releases its
-                        // connection driver, so tunnels share the same admission cap.
-                        request.extensions_mut().insert(service_permit.clone());
-                        let state = service_state.clone();
-                        let span = tracing::info_span!("http_request", method = method_category(request.method()), route = route_category(request.uri().path()));
-                        async move {
-                            tracing::debug!("HTTP request started");
-                            let response = handle(request, state).await;
-                            tracing::debug!(status = response.status().as_u16(), "HTTP response established");
-                            Ok::<_, Infallible>(response)
-                        }.instrument(span)
-                    });
-                    let connection = hyper::server::conn::http1::Builder::new()
-                        .timer(TokioTimer::new()).header_read_timeout(state.config.header_read_timeout)
-                        .serve_connection(TokioIo::new(socket), service).with_upgrades();
-                    tokio::pin!(connection);
-                    tokio::select! {
-                        _ = state.shutdown.cancelled() => { connection.as_mut().graceful_shutdown(); let _ = connection.await; },
-                        _ = &mut connection => {},
-                    }
-                });
-            }
-        }
-    };
-    stop.cancel();
-    state.tasks.close();
-    let cleanup = async {
-        if !source.is_finished() {
-            let _ = (&mut source).await;
-        }
-        while connections.join_next().await.is_some() {}
-        state.tasks.wait().await;
-    };
-    if tokio::time::timeout(Duration::from_secs(5), cleanup)
-        .await
-        .is_err()
-    {
-        source.abort();
-        connections.abort_all();
+    handover::run(listener, state, shutdown, control, imported).await
+}
+
+async fn ordinary_connection(
+    socket: transport::Prefixed,
+    permit: Arc<OwnedSemaphorePermit>,
+    state: Arc<State>,
+    registration: Arc<transport::Registration>,
+) {
+    let service_state = state.clone();
+    let service = service_fn(move |mut request: Request<Incoming>| {
+        request.extensions_mut().insert(permit.clone());
+        request.extensions_mut().insert(registration.clone());
+        let state = service_state.clone();
+        let span = tracing::info_span!(
+            "http_request",
+            method = method_category(request.method()),
+            route = route_category(request.uri().path())
+        );
+        async move { Ok::<_, Infallible>(handle(request, state).await) }.instrument(span)
+    });
+    let connection = hyper::server::conn::http1::Builder::new()
+        .timer(TokioTimer::new())
+        .header_read_timeout(state.config.header_read_timeout)
+        .serve_connection(TokioIo::new(socket), service)
+        .with_upgrades();
+    tokio::pin!(connection);
+    tokio::select! {
+        _ = state.pause.cancelled() => {},
+        _ = state.shutdown.cancelled() => { connection.as_mut().graceful_shutdown(); let _ = connection.await; },
+        _ = &mut connection => {},
     }
-    result
 }
 
 async fn source_owner(state: Arc<State>) {
@@ -566,6 +564,9 @@ async fn handle(mut request: Request<Incoming>, state: Arc<State>) -> Response<B
             ),
         }
     } else if request.method() == Method::GET && path.starts_with("/_bus/") {
+        if path == "/_bus/handover" {
+            return json(StatusCode::OK, state.registry.inspect(&state));
+        }
         match state.router.snapshot().await {
             Ok(snapshot) => {
                 let value = serde_json::to_value(snapshot).unwrap();
@@ -713,6 +714,9 @@ async fn forward(mut request: Request<Incoming>, state: Arc<State>) -> Response<
     let connection_permit = request
         .extensions_mut()
         .remove::<Arc<OwnedSemaphorePermit>>();
+    let registration = request
+        .extensions_mut()
+        .remove::<Arc<transport::Registration>>();
     if request.method() == Method::CONNECT {
         return failure(StatusCode::METHOD_NOT_ALLOWED, "CONNECT is unsupported");
     }
@@ -788,9 +792,11 @@ async fn forward(mut request: Request<Incoming>, state: Arc<State>) -> Response<
         }
         let upstream = hyper::upgrade::on(&mut response);
         let stop = state.shutdown.clone();
+        let pause = state.pause.clone();
         let timeout = state.config.request_timeout;
         state.tasks.spawn(async move {
             let _connection_permit = connection_permit;
+            let _registration = registration;
             let transfer = async {
                 let (down, up) =
                     tokio::time::timeout(timeout, async { tokio::try_join!(downstream, upstream) })
@@ -801,7 +807,7 @@ async fn forward(mut request: Request<Incoming>, state: Arc<State>) -> Response<
                         .await;
                 Ok::<(), BoxError>(())
             };
-            tokio::select! { _ = stop.cancelled() => {}, _ = transfer => {} }
+            tokio::select! { _ = stop.cancelled() => {}, _ = pause.cancelled() => {}, _ = transfer => {} }
         });
     }
     strip_hop(response.headers_mut(), switched);
