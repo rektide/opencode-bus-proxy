@@ -140,3 +140,41 @@ embedded and proxy topologies with origin/proxy/client CPU measured separately.
 
 These checkpoints preserve implementation and correction history; they do not
 claim production rollout or acceptance based solely on passing tests.
+
+## Layout follow-up verification — 2026-10-11
+
+Session `ses_ed35c6048ffegHqs9lkaJQablf` verified the mechanical relocation at
+`c93615f56262` and navigation update at `56cf231cf126`, on telemetry extraction
+`6190889cf750` / `5fe62f1a3139` and handover predecessor `a1782536`.
+Package/API names and package-relative fixture includes are unchanged.
+
+In isolated workspace `/home/rektide/tmp-opencode/glowing-cactus-reorg`, Rust
+1.98.0 passed:
+
+```sh
+cargo test --locked
+cargo test --workspace --all-features --locked
+cargo clippy --all-targets --locked -- -D warnings
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo fmt --all -- --check
+cargo build -p opencode-bus-proxy --no-default-features --locked
+OTEL_TRACES_EXPORTER=none bun run test/compatibility/clients.ts
+```
+
+The two real-systemd-manager tests remain intentionally ignored. Compatibility
+used the real `/home/rektide/src/opencode-bus-smart` checkout through a temporary
+sibling symlink, removed afterward. Its first invocation inherited an OTLP
+endpoint and correctly failed local-only daemon startup; explicitly disabling
+export made the full compatibility suite pass.
+
+`cargo metadata --no-deps --locked` resolves all five packages in the requested
+layout and retains four default members. Per-package `cargo tree --locked
+--no-default-features` for protocol, router, gateway and daemon contains no
+OpenTelemetry, OTLP, reqwest, Arrow or ClickHouse dependencies. All local Markdown
+file links resolve; sibling-checkout links require that sibling. Wrapper build
+and install scripts use Cargo metadata/package selection, not old crate paths.
+The HTTP draft is byte-unchanged and the architecture proposal retains its
+original proposed-path table with an explicit present-layout navigation note.
+
+This verifies the isolated branch, not integration or deployment: primary was
+still actively editing handover files, so its working copy was left untouched.
