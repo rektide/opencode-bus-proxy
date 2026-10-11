@@ -135,6 +135,7 @@ pub struct SubscriptionInfo {
     pub queue_frame_target: usize,
     pub direct_frames: usize,
     pub direct_bytes: usize,
+    pub receive_credit: bool,
 }
 
 /// Index/epoch snapshot at one actor turn. Socket readers can concurrently reduce
@@ -244,6 +245,17 @@ impl Queue {
         lock(&self.backlog).target_frames = frames;
     }
 
+    fn arm_owned_receive(&self) {
+        let mut backlog = lock(&self.backlog);
+        if !self.is_closed()
+            && backlog.target_frames == 0
+            && backlog.frames.is_empty()
+            && backlog.direct.is_none()
+        {
+            backlog.waiting = true;
+        }
+    }
+
     fn admit(&self, frame: Bytes, opening: bool) -> Result<(), RouterError> {
         if self.is_closed() {
             return Err(RouterError::NotFound);
@@ -297,9 +309,11 @@ impl Queue {
                     return None;
                 }
                 if let Some(frame) = backlog.direct.take() {
+                    backlog.waiting = false;
                     return Some(frame);
                 }
                 if let Some(frame) = backlog.frames.pop_front() {
+                    backlog.waiting = false;
                     backlog.bytes -= frame.len();
                     return Some(frame);
                 }
@@ -320,6 +334,7 @@ impl Queue {
 
     fn try_recv(&self) -> Option<Bytes> {
         let mut backlog = lock(&self.backlog);
+        backlog.waiting = false;
         if backlog.closed || self.is_closed() {
             return None;
         }
@@ -361,6 +376,14 @@ impl Subscription {
     /// Drain only already admitted material; does not arm a new receive credit.
     pub fn try_recv(&mut self) -> Option<Bytes> {
         self.queue.try_recv()
+    }
+
+    /// Arm the first zero-queue receive synchronously before restarting a source.
+    /// The transport owner must retain this guard and have no output in flight.
+    /// Normal receives revoke idle credit on cancellation; dropping the guard
+    /// closes its queue. This avoids an import task-scheduling admission race.
+    pub fn arm_owned_receive(&mut self) {
+        self.queue.arm_owned_receive();
     }
 
     /// Relinquish the old guard without closing its queue. Only the handover
@@ -998,6 +1021,7 @@ impl Actor {
                 .direct
                 .as_ref()
                 .map_or(0, Bytes::len);
+            let receive_credit = lock(&subscriber.queue.backlog).waiting;
             let direct_frames = usize::from(direct_bytes > 0);
             let mut sessions: Vec<_> = subscriber.sessions.iter().cloned().collect();
             sessions.sort_unstable();
@@ -1011,6 +1035,7 @@ impl Actor {
                 queue_frame_target: self.queue_frame_target,
                 direct_frames,
                 direct_bytes,
+                receive_credit,
             });
             gauges.subscriptions += 1;
             if subscriber.active {

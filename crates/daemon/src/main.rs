@@ -105,9 +105,37 @@ struct Arguments {
     #[arg(long, env = "BUS_PROXY_HANDOVER_SUCCESSOR")]
     handover_successor: Option<PathBuf>,
 
+    /// Exact buffered transfer, or bounded drain to a clean downstream boundary.
+    #[arg(
+        long,
+        env = "BUS_PROXY_HANDOVER_MODE",
+        default_value = "buffered",
+        value_enum
+    )]
+    handover_mode: ResetMode,
+
+    /// Boundary-mode drain deadline in milliseconds (0..=30000).
+    #[arg(long, env = "BUS_PROXY_HANDOVER_DRAIN_MS", default_value_t = 2000, value_parser = clap::value_parser!(u64).range(0..=30000))]
+    handover_drain_ms: u64,
+
     /// Compatibility probe only; does not load credentials, adopt FDs or start I/O.
     #[arg(long, hide = true)]
     check_handover_format: Option<u32>,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum ResetMode {
+    Buffered,
+    #[value(alias = "unbuffered")]
+    Boundary,
+}
+impl From<ResetMode> for bus_proxy_gateway::handover::HandoverMode {
+    fn from(value: ResetMode) -> Self {
+        match value {
+            ResetMode::Buffered => Self::Buffered,
+            ResetMode::Boundary => Self::Boundary,
+        }
+    }
 }
 
 fn positive(value: &str) -> std::result::Result<usize, String> {
@@ -338,6 +366,10 @@ async fn run(args: Arguments, mut descriptors: HashMap<String, OwnedFd>) -> Resu
     }
     let mut reset = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined2())?;
     let successor = args.handover_successor.unwrap_or(std::env::current_exe()?);
+    let reset_options = bus_proxy_gateway::handover::FreezeOptions {
+        mode: args.handover_mode.into(),
+        drain_timeout: Duration::from_millis(args.handover_drain_ms),
+    };
     let stopped = loop {
         tokio::select! {
             result = stop_signal() => break Stopped::Signal(result),
@@ -345,9 +377,13 @@ async fn run(args: Arguments, mut descriptors: HashMap<String, OwnedFd>) -> Resu
             result = &mut routing => break Stopped::Router(result),
             _ = reset.recv() => {
                 if let Some(manager) = &manager {
-                    let needed = reset_router.snapshot().await?.subscriptions.len().saturating_add(2);
-                    if let Err(error) = manager.reset(&control, notify_socket.as_deref(), &successor, needed).await {
+                    let needed = match reset_router.snapshot().await {
+                        Ok(snapshot) => snapshot.subscriptions.len().saturating_add(2),
+                        Err(error) => { tracing::warn!(%error, "cooperative reset not admitted by router"); continue; }
+                    };
+                    if let Err(error) = manager.reset(&control, notify_socket.as_deref(), &successor, needed, reset_options).await {
                         tracing::warn!(%error, "cooperative reset not committed");
+                        let _ = systemd::notify(notify_socket.as_deref(), &format!("STATUS=cooperative reset not committed; phase={}", control.progress().phase));
                     }
                 } else { tracing::warn!("SIGUSR2 ignored: cooperative reset requires --handover-unit"); }
             }

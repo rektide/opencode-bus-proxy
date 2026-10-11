@@ -113,6 +113,249 @@ fn event(session: &str, id: &str) -> Bytes {
     )
 }
 
+async fn policy(address: std::net::SocketAddr, frames: u32) {
+    let socket = TcpStream::connect(address).await.unwrap();
+    let (mut client, connection) = hyper::client::conn::http1::handshake(TokioIo::new(socket))
+        .await
+        .unwrap();
+    tokio::spawn(connection);
+    let response = client
+        .send_request(
+            Request::builder()
+                .method("PUT")
+                .uri("/_bus/queue")
+                .header("host", address.to_string())
+                .body(Full::new(Bytes::from(format!("{{\"frames\":{frames}}}"))))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+}
+
+async fn credits(router: &Router, ids: &[&str]) {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let snapshot = router.snapshot().await.unwrap();
+            if ids.iter().all(|id| {
+                snapshot
+                    .subscriptions
+                    .iter()
+                    .any(|s| s.id == *id && s.receive_credit)
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn boundary_drain_preserves_ready_clients_zero_policy_and_source_but_closes_stalled_client() {
+    let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let config = Config {
+        upstream: format!("http://{}", origin.local_addr().unwrap()),
+        ..Config::default()
+    };
+    let stop = CancellationToken::new();
+    let (router, routing) = Router::spawn(Limits::default(), stop.clone()).unwrap();
+    let (control, receiver) = handover::channel();
+    let gateway = tokio::spawn(serve_with_handover(
+        listener,
+        config.clone(),
+        router.clone(),
+        stop.clone(),
+        receiver,
+        None,
+    ));
+    let (mut source, _) = origin.accept().await.unwrap();
+    let mut request = Vec::new();
+    while !request.ends_with(b"\r\n\r\n") {
+        request.push(source.read_u8().await.unwrap());
+    }
+    source.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nOpenCode-Event-Scope: 1\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
+    source
+        .write_all(&chunk(
+            b"data: {\"type\":\"server.connected\",\"id\":\"evt_boundary\"}\n\n",
+        ))
+        .await
+        .unwrap();
+    while router.snapshot().await.unwrap().epoch.is_none() {
+        tokio::task::yield_now().await;
+    }
+    let mut fast = Feed::open(address, true).await;
+    let fast_id = fast.next().await["data"]["subscriptionID"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut slow = Feed::open(address, true).await;
+    let slow_id = slow.next().await["data"]["subscriptionID"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for (feed, id) in [(&mut fast, &fast_id), (&mut slow, &slow_id)] {
+        assert_eq!(put(address, id, &["ses_a"]).await, 204);
+        feed.next().await;
+    }
+    let mut pending = Feed::open(address, true).await;
+    let pending_id = pending.next().await["data"]["subscriptionID"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    policy(address, 0).await;
+    credits(&router, &[&fast_id, &slow_id]).await;
+    let large = event_frame(serde_json::json!({"type":"session.text.delta","id":"drained","scope":{"sessionID":"ses_a"},"payload":"x".repeat(6*1024*1024)}).to_string().as_bytes());
+    source.write_all(&chunk(&large)).await.unwrap();
+    while router.snapshot().await.unwrap().counters.publications == 0 {
+        tokio::task::yield_now().await;
+    }
+    let partial = chunk(&event("ses_a", "after-boundary"));
+    source.write_all(&partial[..1]).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let probe = control.freeze().await.unwrap();
+    assert!(
+        probe
+            .image()
+            .clients
+            .iter()
+            .any(|c| c.offset > 0 && c.offset < c.output.len() as u64)
+    );
+    control.resume(probe).await.unwrap();
+    let mut updates = control.watch();
+    let resetting = {
+        let control = control.clone();
+        tokio::spawn(async move {
+            control
+                .freeze_with(handover::FreezeOptions {
+                    mode: handover::HandoverMode::Boundary,
+                    drain_timeout: Duration::from_secs(2),
+                })
+                .await
+                .unwrap()
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if updates.borrow().phase == "draining" {
+                break;
+            }
+            updates.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    // Only this client starts consuming. The other deliberately stays blocked.
+    let reader = tokio::spawn(async move {
+        assert_eq!(fast.next().await["id"], "drained");
+        fast
+    });
+    let frozen = resetting.await.unwrap();
+    let mut fast = reader.await.unwrap();
+    assert_eq!(control.progress().phase, "parked");
+    assert!(control.progress().dropped >= 1);
+    assert_eq!(frozen.image().mode, handover::HandoverMode::Boundary);
+    assert_eq!(frozen.image().router.queue_frame_target, 0);
+    assert_eq!(frozen.image().clients.len(), 2);
+    let aborted = tokio::time::timeout(Duration::from_secs(3), async {
+        while let Some(frame) = slow.body.frame().await {
+            if frame.is_err() {
+                return true;
+            }
+        }
+        false
+    })
+    .await
+    .unwrap();
+    assert!(
+        aborted,
+        "boundary straggler fails its incomplete HTTP chunk, not a successful EOF"
+    );
+    assert!(frozen.image().clients.iter().all(|c| c.output.is_empty()));
+    assert!(
+        frozen
+            .image()
+            .router
+            .subscriptions
+            .iter()
+            .all(|s| s.frames.is_empty() && s.direct.is_none())
+    );
+    assert!(
+        !frozen
+            .image()
+            .router
+            .subscriptions
+            .iter()
+            .any(|s| s.id == slow_id)
+    );
+    assert_eq!(
+        frozen.image().source.buffer,
+        partial[..1],
+        "boundary mode still transfers exact source framing/read-ahead"
+    );
+    // TCP handshakes queue in the retained listener; acceptance really stops.
+    let mut queued = TcpStream::connect(address).await.unwrap();
+    queued
+        .write_all(format!("GET /_bus/health HTTP/1.1\r\nHost: {address}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut byte = [0; 1];
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), queued.read(&mut byte))
+            .await
+            .is_err()
+    );
+    let image = handover::decode(&handover::encode(frozen.image()).unwrap()).unwrap();
+    let mut fds: HashMap<_, _> = frozen.descriptors().unwrap().into_iter().collect();
+    let listener = std::net::TcpListener::from(fds.remove("listener").unwrap());
+    listener.set_nonblocking(true).unwrap();
+    stop.cancel();
+    gateway.await.unwrap().unwrap();
+    routing.await.unwrap();
+    drop(frozen);
+    let stop = CancellationToken::new();
+    let (router, routing, imported) = image
+        .import(&config, Limits::default(), fds, stop.clone())
+        .unwrap();
+    let (_, receiver) = handover::channel();
+    let gateway = tokio::spawn(serve_with_handover(
+        TcpListener::from_std(listener).unwrap(),
+        config,
+        router.clone(),
+        stop.clone(),
+        receiver,
+        Some(imported),
+    ));
+    credits(&router, &[&fast_id]).await;
+    source.write_all(&partial[1..]).await.unwrap();
+    assert_eq!(fast.next().await["id"], "after-boundary");
+    assert_eq!(put(address, &slow_id, &["ses_a"]).await, 404);
+    assert_eq!(put(address, &pending_id, &["ses_b"]).await, 204);
+    assert_eq!(pending.next().await["type"], "server.connected");
+    let mut reply = Vec::new();
+    while !reply.ends_with(b"\r\n\r\n") {
+        reply.push(
+            tokio::time::timeout(Duration::from_secs(2), queued.read_u8())
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+    }
+    assert!(reply.starts_with(b"HTTP/1.1 200"));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), origin.accept())
+            .await
+            .is_err()
+    );
+    assert_eq!(router.snapshot().await.unwrap().counters.epochs_ended, 0);
+    stop.cancel();
+    gateway.await.unwrap().unwrap();
+    routing.await.unwrap();
+}
+
 #[tokio::test]
 async fn established_responses_and_live_only_source_survive_two_successors_and_abort() {
     let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();

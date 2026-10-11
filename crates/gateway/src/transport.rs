@@ -100,16 +100,23 @@ impl ClientOwner {
             std::mem::take(&mut image.output),
             std::mem::take(&mut image.offset),
         );
-        Self {
+        let mut owner = Self {
             socket,
             sub,
             image,
             output,
             _permit: permit,
-        }
+        };
+        owner.arm_receive();
+        owner
     }
     pub(crate) fn output_len(&self) -> usize {
         self.output.len()
+    }
+    pub(crate) fn arm_receive(&mut self) {
+        if !self.output.pending() {
+            self.sub.arm_owned_receive();
+        }
     }
     pub(crate) fn snapshot(&self) -> ClientImage {
         let mut image = self.image.clone();
@@ -309,6 +316,44 @@ pub(crate) async fn client(mut owner: ClientOwner, state: Arc<State>) -> Option<
             }
             _ = heartbeat.tick(), if !owner.output.pending() => {
                 owner.output = Output::chunk(Bytes::from_static(b": heartbeat\n\n"));
+            }
+        }
+    }
+}
+
+/// Best-effort boundary cut: source and ordinary/control tasks are already
+/// parked. Drain all prior admissions, never create heartbeats or new credit.
+/// A straggler is closed, not resumed with missing already-dequeued bytes.
+pub(crate) async fn drain(
+    mut owner: ClientOwner,
+    state: Arc<State>,
+    deadline: tokio::time::Instant,
+) -> Option<ClientOwner> {
+    let retired = owner.sub.cancellation_token();
+    loop {
+        if retired.is_cancelled() || state.shutdown.is_cancelled() {
+            return None;
+        }
+        if !owner.output.pending() {
+            if let Some(frame) = owner.sub.try_recv() {
+                owner.output = Output::chunk(frame);
+            } else {
+                return Some(owner);
+            }
+        }
+        tokio::select! {
+            biased;
+            _ = state.shutdown.cancelled() => return None,
+            _ = retired.cancelled() => return None,
+            _ = tokio::time::sleep_until(deadline) => return None,
+            result = owner.socket.writable() => {
+                if result.is_err() { return None; }
+                match owner.socket.try_write_vectored(&owner.output.slices()) {
+                    Ok(0) => return None,
+                    Ok(n) => owner.output.advance(n),
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {},
+                    Err(_) => return None,
+                }
             }
         }
     }

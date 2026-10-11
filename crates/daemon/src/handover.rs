@@ -153,6 +153,7 @@ impl Manager {
         socket: Option<&OsStr>,
         successor: &Path,
         needed: usize,
+        options: handover::FreezeOptions,
     ) -> Result<()> {
         if socket.is_none_or(|s| s.is_empty()) {
             return Err("cooperative reset requires NOTIFY_SOCKET".into());
@@ -174,9 +175,21 @@ impl Manager {
         if !result.status.success() {
             return Err("successor does not accept this handover format".into());
         }
-        let frozen = tokio::time::timeout(Duration::from_secs(10), control.freeze())
-            .await?
-            .map_err(io::Error::other)?;
+        let mut updates = control.watch();
+        let preparation = tokio::time::timeout(
+            Duration::from_secs(10) + options.drain_timeout,
+            control.freeze_with(options),
+        );
+        tokio::pin!(preparation);
+        let frozen = loop {
+            tokio::select! {
+                result = &mut preparation => break result?.map_err(io::Error::other)?,
+                changed = updates.changed() => {
+                    if changed.is_ok() { status(socket, &updates.borrow()); }
+                }
+            }
+        };
+        status(socket, &control.progress());
         let mut offered = Vec::new();
         let prepared = async {
             let bytes = handover::encode(frozen.image())?;
@@ -223,6 +236,21 @@ impl Manager {
         }
         Ok(())
     }
+}
+
+fn status(socket: Option<&OsStr>, progress: &handover::Progress) {
+    let _ = systemd::notify(
+        socket,
+        &format!(
+            "STATUS=handover phase={} mode={:?} clients={} pending={} kept={} dropped={}",
+            progress.phase,
+            progress.mode,
+            progress.clients,
+            progress.pending,
+            progress.kept,
+            progress.dropped
+        ),
+    );
 }
 
 fn parse_dump(value: &serde_json::Value) -> Result<HashMap<String, Identity>> {

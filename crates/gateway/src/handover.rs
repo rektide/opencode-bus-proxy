@@ -19,7 +19,7 @@ use std::{
 };
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::{Semaphore, mpsc, oneshot},
+    sync::{Semaphore, mpsc, oneshot, watch},
     task::JoinSet,
 };
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
@@ -27,25 +27,73 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 pub const FORMAT_VERSION: u32 = 1;
 pub const IMAGE_LIMIT: usize = 256 * 1024 * 1024;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HandoverMode {
+    #[default]
+    Buffered,
+    Boundary,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct FreezeOptions {
+    pub mode: HandoverMode,
+    pub drain_timeout: Duration,
+}
+impl Default for FreezeOptions {
+    fn default() -> Self {
+        Self {
+            mode: HandoverMode::Buffered,
+            drain_timeout: Duration::from_secs(2),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct Progress {
+    pub phase: &'static str,
+    pub mode: Option<HandoverMode>,
+    pub clients: usize,
+    pub pending: usize,
+    pub kept: usize,
+    pub dropped: usize,
+}
+impl Default for Progress {
+    fn default() -> Self {
+        Self {
+            phase: "running",
+            mode: None,
+            clients: 0,
+            pending: 0,
+            kept: 0,
+            dropped: 0,
+        }
+    }
+}
+
 #[derive(Clone, Default)]
-pub(crate) struct Registry(Arc<Mutex<HashMap<String, serde_json::Value>>>);
+pub(crate) struct Registry {
+    connections: Arc<Mutex<HashMap<String, serde_json::Value>>>,
+    progress: Arc<Mutex<Progress>>,
+}
 impl Registry {
     pub(crate) fn register(&self, key: &str, sub: Option<&str>) {
-        self.0.lock().unwrap().insert(key.into(), serde_json::json!({"connection": key, "subscription": sub,
+        self.connections.lock().unwrap().insert(key.into(), serde_json::json!({"connection": key, "subscription": sub,
             "capability": if sub.is_some() { "transferable" } else { "unsupported" },
             "role": if sub.is_some() { "http1_sse" } else { "http_or_tunnel" },
             "reason": if sub.is_some() { "established_serializable_transport" } else { "opaque_hyper_or_pending_headers" }}));
     }
     pub(crate) fn remove(&self, key: &str) {
-        self.0.lock().unwrap().remove(key);
+        self.connections.lock().unwrap().remove(key);
     }
     pub(crate) fn inspect(&self, state: &State) -> serde_json::Value {
-        let mut connections: Vec<_> = self.0.lock().unwrap().values().cloned().collect();
+        let mut connections: Vec<_> = self.connections.lock().unwrap().values().cloned().collect();
         connections.sort_by(|a, b| a["connection"].as_str().cmp(&b["connection"].as_str()));
         let ready = state.source_ready.load(Ordering::Acquire);
         serde_json::json!({"format_version": FORMAT_VERSION, "source_transferable": ready && state.config.upstream.starts_with("http://"),
             "source_reason": if !state.config.upstream.starts_with("http://") { "tls_state_unsupported" } else if !ready { "source_not_ready" } else { "established_http1" },
-            "connections": connections, "consistency": "observational", "image_limit_bytes": IMAGE_LIMIT})
+            "connections": connections, "progress": self.progress.lock().unwrap().clone(), "supported_modes": ["buffered", "boundary"],
+            "consistency": "observational", "image_limit_bytes": IMAGE_LIMIT})
     }
 }
 
@@ -63,6 +111,8 @@ pub struct Image {
     pub clients: Vec<ClientImage>,
     pub router: RouterImage,
     pub metrics: [u64; 3],
+    pub mode: HandoverMode,
+    pub dropped_connections: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -174,6 +224,8 @@ pub struct Imported {
     source: SourceOwner,
     clients: Vec<(TcpStream, ClientImage, Subscription)>,
     metrics: [u64; 3],
+    mode: HandoverMode,
+    dropped: usize,
 }
 
 impl Image {
@@ -201,6 +253,16 @@ impl Image {
             || sockets.len() != self.sockets.len()
             || self.generation.is_empty()
             || self.generation.len() > 64
+            || (self.mode == HandoverMode::Boundary
+                && (self
+                    .clients
+                    .iter()
+                    .any(|c| !c.output.is_empty() || c.offset != 0)
+                    || self
+                        .router
+                        .subscriptions
+                        .iter()
+                        .any(|s| !s.frames.is_empty() || s.direct.is_some())))
         {
             return Err(invalid());
         }
@@ -300,6 +362,8 @@ impl Image {
                 source,
                 clients,
                 metrics: self.metrics,
+                mode: self.mode,
+                dropped: self.dropped_connections,
             },
         ))
     }
@@ -365,21 +429,34 @@ impl Parked {
 }
 
 enum Command {
-    Freeze(oneshot::Sender<Result<Frozen, String>>),
+    Freeze(FreezeOptions, oneshot::Sender<Result<Frozen, String>>),
     Resume(String, oneshot::Sender<()>),
 }
 #[derive(Clone)]
-pub struct Controller(mpsc::Sender<Command>);
-pub struct Receiver(mpsc::Receiver<Command>);
+pub struct Controller(mpsc::Sender<Command>, watch::Receiver<Progress>);
+pub struct Receiver(mpsc::Receiver<Command>, watch::Sender<Progress>);
 pub fn channel() -> (Controller, Receiver) {
     let (send, recv) = mpsc::channel(2);
-    (Controller(send), Receiver(recv))
+    let (progress, current) = watch::channel(Progress::default());
+    (Controller(send, current), Receiver(recv, progress))
 }
 impl Controller {
     pub async fn freeze(&self) -> Result<Frozen, String> {
+        self.freeze_with(FreezeOptions::default()).await
+    }
+    pub fn progress(&self) -> Progress {
+        self.1.borrow().clone()
+    }
+    pub fn watch(&self) -> watch::Receiver<Progress> {
+        self.1.clone()
+    }
+    pub async fn freeze_with(&self, options: FreezeOptions) -> Result<Frozen, String> {
+        if options.drain_timeout > Duration::from_secs(30) {
+            return Err("drain timeout must not exceed 30 seconds".into());
+        }
         let (send, recv) = oneshot::channel();
         self.0
-            .send(Command::Freeze(send))
+            .send(Command::Freeze(options, send))
             .await
             .map_err(|_| "gateway closed")?;
         recv.await.map_err(|_| "gateway closed")?
@@ -419,7 +496,13 @@ pub(crate) async fn run(
 ) -> Result<(), GatewayError> {
     let permits = Arc::new(Semaphore::new(state.config.max_connections));
     let mut connections = JoinSet::new();
+    let mut progress = Progress::default();
     let mut source = if let Some(imported) = imported {
+        state.source_ready.store(true, Ordering::Release);
+        progress.mode = Some(imported.mode);
+        progress.kept = imported.clients.len();
+        progress.dropped = imported.dropped;
+        publish_progress(&state, &control.1, &progress);
         state
             .metrics
             .frames
@@ -458,11 +541,13 @@ pub(crate) async fn run(
             result = &mut source => break result.map(|_| ()).map_err(GatewayError::SourceTask),
             Some(_) = connections.join_next(), if !connections.is_empty() => {},
             command = control.0.recv(), if !control.0.is_closed() => {
-                let Some(Command::Freeze(reply)) = command else { continue; };
+                let Some(Command::Freeze(options, reply)) = command else { continue; };
                 if !state.config.upstream.starts_with("http://") || !state.source_ready.load(Ordering::Acquire) {
                     let _ = reply.send(Err("handover requires a ready plain-HTTP source; HTTPS/TLS and offline sources are unsupported".into()));
                     continue;
                 }
+                progress = Progress { phase: "quiescing", mode: Some(options.mode), clients: state.registry.connections.lock().unwrap().len(), pending: 0, kept: 0, dropped: 0 };
+                publish_progress(&state, &control.1, &progress);
                 state.pause.cancel();
                 let mut parked = Vec::new();
                 while let Some(result) = connections.join_next().await {
@@ -471,6 +556,24 @@ pub(crate) async fn run(
                 state.tasks.close();
                 state.tasks.wait().await;
                 let parked_source = (&mut source).await.map_err(GatewayError::SourceTask)?;
+                // All accepted ordinary/control exchanges and the complete source
+                // publication batch have settled. No admission can race a drain.
+                let _ = state.router.snapshot().await;
+                progress.dropped = progress.clients.saturating_sub(parked.len());
+                if options.mode == HandoverMode::Boundary {
+                    progress.phase = "draining";
+                    progress.pending = parked.len();
+                    publish_progress(&state, &control.1, &progress);
+                    let deadline = tokio::time::Instant::now() + options.drain_timeout;
+                    let mut draining = JoinSet::new();
+                    for client in parked.drain(..) { draining.spawn(transport::drain(client, state.clone(), deadline)); }
+                    while let Some(result) = draining.join_next().await {
+                        match result { Ok(Some(client)) => parked.push(client), _ => progress.dropped += 1 }
+                        progress.pending = draining.len();
+                        progress.kept = parked.len();
+                        publish_progress(&state, &control.1, &progress);
+                    }
+                }
                 // Bound aggregate transport + router image duplication before
                 // cloning parked outputs or queue frames into the private image.
                 let transport_weight = parked_source.as_ref().map_or(IMAGE_LIMIT, |source| {
@@ -503,18 +606,23 @@ pub(crate) async fn run(
                         let image = Image { version: FORMAT_VERSION, generation, boot_id: boot_id().map_err(GatewayError::Listener)?, cut_ms: monotonic_ms(),
                             compatibility: compatibility(&state.config), listener_address: listener.local_addr().map_err(GatewayError::Listener)?, sockets,
                             source: source_owner.image.clone(), clients: parked.iter().map(ClientOwner::snapshot).collect(), router: router_image,
-                            metrics: [state.metrics.frames.load(Ordering::Relaxed), state.metrics.bytes.load(Ordering::Relaxed), state.metrics.failures.load(Ordering::Relaxed)] };
+                            metrics: [state.metrics.frames.load(Ordering::Relaxed), state.metrics.bytes.load(Ordering::Relaxed), state.metrics.failures.load(Ordering::Relaxed)],
+                            mode: options.mode, dropped_connections: progress.dropped };
                          Parked { listener, source: source_owner, clients: parked, image: Arc::new(image) }
                     }
                     (source_owner, _) => {
                         let _ = state.router.thaw().await;
                         state = renewed(&state);
-                        for client in parked { connections.spawn(transport::client(client, state.clone())); }
+                        for mut client in parked { client.arm_receive(); connections.spawn(transport::client(client, state.clone())); }
                         source = spawn_source(state.clone(), source_owner);
+                        progress.phase = "running"; progress.pending = 0;
+                        publish_progress(&state, &control.1, &progress);
                         let _ = reply.send(Err("source readiness, router or image budget prevented exporting the cut; old owners resumed (a failed source still retires its epoch)".into()));
                         continue;
                     }
                 };
+                progress.phase = "parked"; progress.pending = 0; progress.kept = frozen.clients.len();
+                publish_progress(&state, &control.1, &progress);
                 let abandoned = CancellationToken::new();
                 let mut ack = None;
                 match frozen.lease(abandoned.clone()) {
@@ -529,7 +637,7 @@ pub(crate) async fn run(
                                 command = control.0.recv() => match command {
                                     Some(Command::Resume(generation, sender)) if generation == frozen.image.generation => { ack = Some(sender); break; }
                                     Some(Command::Resume(_, _)) => {},
-                                    Some(Command::Freeze(reply)) => { let _ = reply.send(Err("handover already prepared".into())); }
+                                    Some(Command::Freeze(_, reply)) => { let _ = reply.send(Err("handover already prepared".into())); }
                                     None => break,
                                 }
                             }
@@ -540,8 +648,10 @@ pub(crate) async fn run(
                 listener = frozen.listener;
                 state.router.thaw().await.map_err(|_| GatewayError::Configuration("router thaw failed"))?;
                 state = renewed(&state);
-                for client in frozen.clients { connections.spawn(transport::client(client, state.clone())); }
+                for mut client in frozen.clients { client.arm_receive(); connections.spawn(transport::client(client, state.clone())); }
                 source = spawn_source(state.clone(), Some(frozen.source));
+                progress.phase = "running";
+                publish_progress(&state, &control.1, &progress);
                 if let Some(ack) = ack { let _ = ack.send(()); }
             }
             accepted = async {
@@ -574,6 +684,12 @@ pub(crate) async fn run(
     result
 }
 
+fn publish_progress(state: &State, sender: &watch::Sender<Progress>, progress: &Progress) {
+    *state.registry.progress.lock().unwrap() = progress.clone();
+    sender.send_replace(progress.clone());
+    tracing::info!(phase = progress.phase, mode = ?progress.mode, kept = progress.kept, dropped = progress.dropped, pending = progress.pending, "handover progress");
+}
+
 fn renewed(old: &State) -> Arc<State> {
     Arc::new(State {
         config: old.config.clone(),
@@ -583,7 +699,7 @@ fn renewed(old: &State) -> Arc<State> {
         shutdown: old.shutdown.clone(),
         tasks: TaskTracker::new(),
         pause: CancellationToken::new(),
-        source_ready: std::sync::atomic::AtomicBool::new(false),
+        source_ready: std::sync::atomic::AtomicBool::new(old.source_ready.load(Ordering::Acquire)),
         metrics: Metrics {
             frames: old.metrics.frames.load(Ordering::Relaxed).into(),
             bytes: old.metrics.bytes.load(Ordering::Relaxed).into(),

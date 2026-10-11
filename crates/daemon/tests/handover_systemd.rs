@@ -146,7 +146,7 @@ async fn source(origin: &TcpListener) -> TcpStream {
     socket
 }
 
-async fn start(label: &str, capacity: usize) -> (Unit, TcpListener, SocketAddr) {
+async fn start(label: &str, capacity: usize, mode: &str) -> (Unit, TcpListener, SocketAddr) {
     let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = reservation.local_addr().unwrap();
@@ -177,6 +177,10 @@ async fn start(label: &str, capacity: usize) -> (Unit, TcpListener, SocketAddr) 
             "--handover-user",
             "--handover-successor",
             env!("CARGO_BIN_EXE_opencode-bus-proxy"),
+            "--handover-mode",
+            mode,
+            "--handover-drain-ms",
+            "500",
         ])
         .output()
         .await
@@ -192,7 +196,43 @@ async fn start(label: &str, capacity: usize) -> (Unit, TcpListener, SocketAddr) 
 #[tokio::test]
 #[ignore = "requires systemd user manager and busctl; creates only obp-handover-test-* unit"]
 async fn real_systemd_replacement_preserves_source_clients_and_invalidates_image_before_crash() {
-    let (unit, origin, address) = start("survival", 32).await;
+    survival("buffered").await;
+}
+
+#[tokio::test]
+#[ignore = "requires systemd user manager and busctl; creates only obp-handover-test-* unit"]
+async fn real_systemd_boundary_replacement_preserves_zero_policy_source_and_ready_clients() {
+    survival("boundary").await;
+}
+
+async fn local(
+    address: SocketAddr,
+    method: &str,
+    path: &str,
+    bytes: &'static [u8],
+) -> serde_json::Value {
+    let socket = TcpStream::connect(address).await.unwrap();
+    let (mut client, connection) = hyper::client::conn::http1::handshake(TokioIo::new(socket))
+        .await
+        .unwrap();
+    tokio::spawn(connection);
+    let response = client
+        .send_request(
+            Request::builder()
+                .method(method)
+                .uri(path)
+                .header("host", address.to_string())
+                .body(Full::new(Bytes::from_static(bytes)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap()
+}
+
+async fn survival(mode: &str) {
+    let (unit, origin, address) = start(mode, 32, mode).await;
     let mut upstream = source(&origin).await;
     tokio::time::sleep(Duration::from_millis(40)).await;
     let mut feed = Feed::open(address).await;
@@ -204,7 +244,27 @@ async fn real_systemd_replacement_preserves_source_clients_and_invalidates_image
     assert_eq!(feed.next().await["type"], "server.connected");
     upstream.write_all(&chunk(&event("before"))).await.unwrap();
     assert_eq!(feed.next().await["id"], "before");
+    assert_eq!(
+        local(address, "PUT", "/_bus/queue", b"{\"frames\":0}").await["frames"],
+        0
+    );
     for round in 0..2 {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let snapshot = local(address, "GET", "/_bus/subscriptions", b"").await;
+                if snapshot["subscriptions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|s| s["id"] == id && s["receive_credit"] == true)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
         let old = property(&unit, "MainPID").await;
         assert_eq!(property(&unit, "NFileDescriptorStore").await, "1");
         let wire = chunk(&event(&format!("after-{round}")));
@@ -215,6 +275,15 @@ async fn real_systemd_replacement_preserves_source_clients_and_invalidates_image
         assert_ne!(old, new);
         upstream.write_all(&wire[wire.len() / 2..]).await.unwrap();
         assert_eq!(feed.next().await["id"], format!("after-{round}"));
+        assert_eq!(
+            local(address, "GET", "/_bus/queue", b"").await["frames"],
+            0,
+            "runtime-selected zero target survives process replacement"
+        );
+        assert_eq!(
+            local(address, "GET", "/_bus/handover", b"").await["progress"]["mode"],
+            mode
+        );
         assert_eq!(
             interest(address, &id).await,
             204,
@@ -251,7 +320,7 @@ async fn real_systemd_replacement_preserves_source_clients_and_invalidates_image
 #[tokio::test]
 #[ignore = "requires systemd user manager and busctl; creates only obp-handover-test-* unit"]
 async fn insufficient_fdstore_capacity_rejects_reset_without_client_bounce() {
-    let (unit, origin, address) = start("reject", 1).await;
+    let (unit, origin, address) = start("reject", 1, "buffered").await;
     let mut upstream = source(&origin).await;
     tokio::time::sleep(Duration::from_millis(40)).await;
     let mut feed = Feed::open(address).await;
