@@ -23,10 +23,40 @@ interest declarations and retain broadcast semantics. The existing client settin
 
 ## Credentials and browser compatibility
 
-Supply the origin's shared password through `OPENCODE_SERVER_PASSWORD` or
-`--password-file` (`BUS_PROXY_PASSWORD_FILE`). A file takes precedence and trailing
-CR/LF is removed; other whitespace is significant. The default username is
-`opencode`, configurable through `--username`/`OPENCODE_SERVER_USERNAME`.
+Supply the origin's shared password through `OPENCODE_SERVER_PASSWORD`,
+`--password-file` (`BUS_PROXY_PASSWORD_FILE`), or `--credential`
+(`BUS_PROXY_CREDENTIAL`); `--password-file` and `--credential` together is
+rejected. A file or credential takes precedence over the environment variable,
+and trailing CR/LF is removed; other whitespace is significant.
+The default username is `opencode`, configurable through
+`--username`/`OPENCODE_SERVER_USERNAME`.
+
+`--credential` names a systemd credential: the daemon reads
+`$CREDENTIALS_DIRECTORY/<name>`, which any of `LoadCredential=`,
+`LoadCredentialEncrypted=`, `SetCredential=`, or `ImportCredential=` provides
+(systemd ≥247; ≥250 for encrypted). Encrypted credentials are decrypted before
+the daemon sees them, so the same flag covers both. Credential names must be
+filename-safe (leading letter or digit, then letters, digits, `.`, `-`, `_`) —
+validated before the name is joined to the directory, so a misconfigured name
+cannot traverse elsewhere. A system unit can hand over the password without
+plaintext argv or environment:
+
+```ini
+[Service]
+ExecStart=/usr/local/bin/opencode-bus-proxy \
+    --upstream http://127.0.0.1:4096 \
+    --listen 127.0.0.1:4097 \
+    --credential opencode-password
+LoadCredential=opencode-password:/etc/opencode/server-password
+# Alternatively, encrypted at rest (binds the name; decrypt at start):
+# LoadCredentialEncrypted=opencode-password:/etc/opencode/server-password.cred
+```
+
+Create the encrypted form with
+`systemd-creds encrypt --name=opencode-password /dev/stdin /etc/opencode/server-password.cred`.
+`--password-file %d/opencode-password` in `ExecStart=` also works without the
+flag, but `--credential` fails with a named cause instead of a generic missing
+file when the unit forgets the `LoadCredential=` line.
 
 Local feed and diagnostic routes accept the native Basic/query credentials and
 password-signed pairing sessions. Ordinary forwarded requests retain the caller's

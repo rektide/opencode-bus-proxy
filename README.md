@@ -34,8 +34,9 @@ target/release/opencode-bus-proxy \
   --password-file /path/to/shared-server-password
 ```
 
-Use the same password as the origin, either from the file or
-`OPENCODE_SERVER_PASSWORD`. Configure clients with the proxy URL and their usual
+Use the same password as the origin, from a file, `OPENCODE_SERVER_PASSWORD`,
+or a systemd credential named with `--credential` (`BUS_PROXY_CREDENTIAL`).
+Configure clients with the proxy URL and their usual
 credentials. Enable the existing `experimental.session_streaming` client setting
 to use selective delivery. Without that setting, bus-smart clients also broadcast.
 
