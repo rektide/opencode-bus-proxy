@@ -176,7 +176,10 @@ async fn main() -> Result<()> {
     } else {
         HashMap::new()
     };
-    let telemetry = telemetry::init(args.log_json)?;
+    // TLS process policy belongs to the host, independent of telemetry activation.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let json = args.log_json;
+    let telemetry = tokio::task::spawn_blocking(move || telemetry::init(json)).await??;
     let result = run(args, descriptors).await;
     // The batch worker uses blocking HTTP; flush outside Tokio's worker threads.
     tokio::task::spawn_blocking(move || telemetry.shutdown()).await?;

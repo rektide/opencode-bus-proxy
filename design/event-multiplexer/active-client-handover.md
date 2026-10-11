@@ -189,10 +189,10 @@ double writer, replayed kernel bytes or lost userspace bytes.
 
 ## Sources
 
-- Current implementation: [daemon/systemd](../../crates/daemon/src/systemd.rs),
-  [gateway](../../crates/gateway/src/lib.rs),
-  [router](../../crates/router/src/lib.rs),
-  [SSE decoder](../../crates/protocol/src/sse.rs).
+- Current implementation: [daemon/systemd](../../cli/daemon/src/systemd.rs),
+  [gateway](../../components/gateway/src/lib.rs),
+  [router](../../components/router/src/lib.rs),
+  [SSE decoder](../../components/protocol/src/sse.rs).
 - [systemd sd_notify contract](https://github.com/systemd/systemd/blob/main/man/sd_notify.xml):
   FDSTORE, FDNAME, FDSTOREREMOVE, FDPOLL, BARRIER and notification return semantics;
   retrieved 2026-10-11. It explicitly recommends memfd for application state.

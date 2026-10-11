@@ -1,14 +1,21 @@
-use opentelemetry::trace::TracerProvider;
-use opentelemetry_sdk::{Resource, trace::SdkTracerProvider};
+#[cfg(feature = "otlp")]
+use bus_proxy_telemetry::{
+    opentelemetry, otlp,
+    sdk::{self, Resource, trace::SdkTracerProvider},
+};
 use tracing_subscriber::{EnvFilter, Layer, prelude::*};
 
 use crate::Result;
 
-pub struct Telemetry(Option<SdkTracerProvider>);
+pub struct Telemetry {
+    #[cfg(feature = "otlp")]
+    provider: Option<SdkTracerProvider>,
+}
 
 impl Telemetry {
     pub fn shutdown(self) {
-        if let Some(provider) = self.0
+        #[cfg(feature = "otlp")]
+        if let Some(provider) = self.provider
             && let Err(error) = provider.shutdown()
         {
             eprintln!("OTLP shutdown failed: {error}");
@@ -32,6 +39,13 @@ fn enabled(disabled: Option<&str>, exporter: Option<&str>, endpoint: bool) -> Re
     }
 }
 
+fn require_backend(enabled: bool, compiled: bool) -> Result<()> {
+    if enabled && !compiled {
+        return Err("OTLP export requested but not compiled; rebuild opencode-bus-proxy with --features otlp (or disable with OTEL_TRACES_EXPORTER=none)".into());
+    }
+    Ok(())
+}
+
 pub fn init(json: bool) -> Result<Telemetry> {
     let enabled = enabled(
         setting("OTEL_SDK_DISABLED").as_deref(),
@@ -39,8 +53,11 @@ pub fn init(json: bool) -> Result<Telemetry> {
         setting("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT").is_some()
             || setting("OTEL_EXPORTER_OTLP_ENDPOINT").is_some(),
     )?;
+    require_backend(enabled, cfg!(feature = "otlp"))?;
+    #[cfg(feature = "otlp")]
     let export_filter =
         EnvFilter::try_new(setting("BUS_PROXY_OTEL_FILTER").unwrap_or_else(|| "info".into()))?;
+    #[cfg(feature = "otlp")]
     let provider = if enabled {
         let protocol = setting("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL")
             .or_else(|| setting("OTEL_EXPORTER_OTLP_PROTOCOL"));
@@ -50,9 +67,20 @@ pub fn init(json: bool) -> Result<Telemetry> {
         ) {
             return Err("OTLP protocol must be http/protobuf or http/json".into());
         }
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let exporter = opentelemetry_otlp::SpanExporter::builder()
+        use otlp::WithHttpConfig;
+        // Client construction/drop and provider lifecycle must stay off async
+        // workers. Explicit client selection survives Cargo feature unification.
+        let timeout = setting("OTEL_EXPORTER_OTLP_TRACES_TIMEOUT")
+            .or_else(|| setting("OTEL_EXPORTER_OTLP_TIMEOUT"))
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(std::time::Duration::from_millis)
+            .unwrap_or_else(|| std::time::Duration::from_secs(10));
+        let client = reqwest::blocking::Client::builder()
+            .timeout(timeout)
+            .build()?;
+        let exporter = otlp::SpanExporter::builder()
             .with_http()
+            .with_http_client(client)
             .build()?;
         // Resource detectors honor OTEL_SERVICE_NAME and OTEL_RESOURCE_ATTRIBUTES.
         let detected = Resource::builder().build();
@@ -71,30 +99,25 @@ pub fn init(json: bool) -> Result<Telemetry> {
                 env!("CARGO_PKG_VERSION"),
             ))
             .build();
+        // This is the deliberate SDK environment adapter. Reusable composition
+        // receives concrete policy instead of consulting ambient configuration.
+        let policy = sdk::trace::Config::default();
         Some(
-            SdkTracerProvider::builder()
-                .with_resource(resource)
-                .with_batch_exporter(exporter)
-                .build(),
+            bus_proxy_telemetry::ProviderConfig {
+                resource,
+                sampler: policy.sampler,
+                span_limits: policy.span_limits,
+                batch: sdk::trace::BatchConfig::default(),
+            }
+            .build(exporter),
         )
     } else {
         None
     };
-    let otel = provider.as_ref().map(|provider| {
-        tracing_opentelemetry::layer()
-            .with_tracer(provider.tracer("opencode-bus-proxy"))
-            // Never export exporter/HTTP-client internals back into themselves.
-            .with_filter(tracing_subscriber::filter::filter_fn(|metadata| {
-                [
-                    "bus_proxy_gateway",
-                    "bus_proxy_router",
-                    "opencode_bus_proxy",
-                ]
-                .iter()
-                .any(|target| metadata.target().starts_with(target))
-            }))
-            .with_filter(export_filter)
-    });
+    #[cfg(feature = "otlp")]
+    let otel = provider
+        .as_ref()
+        .map(|provider| bus_proxy_telemetry::layer(provider, export_filter));
     let local_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,hyper=warn,h2=warn"));
     let local = if json {
@@ -102,12 +125,14 @@ pub fn init(json: bool) -> Result<Telemetry> {
     } else {
         tracing_subscriber::fmt::layer().boxed()
     };
-    let telemetry = Telemetry(provider);
-    if let Err(error) = tracing_subscriber::registry()
-        .with(otel)
-        .with(local.with_filter(local_filter))
-        .try_init()
-    {
+    let telemetry = Telemetry {
+        #[cfg(feature = "otlp")]
+        provider,
+    };
+    let subscriber = tracing_subscriber::registry();
+    #[cfg(feature = "otlp")]
+    let subscriber = subscriber.with(otel);
+    if let Err(error) = subscriber.with(local.with_filter(local_filter)).try_init() {
         telemetry.shutdown();
         return Err(error.into());
     }
@@ -125,6 +150,25 @@ mod tests {
         assert!(enabled(None, Some("otlp"), false).unwrap());
         assert!(!enabled(None, Some("none"), true).unwrap());
         assert!(!enabled(Some("TRUE"), Some("otlp"), true).unwrap());
+        assert!(!enabled(Some("true"), Some("typo"), true).unwrap());
         assert!(enabled(None, Some("typo"), true).is_err());
+    }
+
+    #[test]
+    fn unavailable_backend_is_actionable_and_disable_wins() {
+        for selection in [
+            enabled(None, Some("otlp"), false),
+            enabled(None, None, true),
+        ] {
+            assert!(
+                require_backend(selection.unwrap(), false)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("--features otlp")
+            );
+        }
+        assert!(require_backend(enabled(None, Some("none"), true).unwrap(), false).is_ok());
+        assert!(require_backend(enabled(Some("true"), Some("otlp"), true).unwrap(), false).is_ok());
+        assert!(require_backend(true, true).is_ok());
     }
 }

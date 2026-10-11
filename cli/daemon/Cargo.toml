@@ -4,6 +4,15 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+otel = ["dep:bus-proxy-telemetry"]
+otlp = ["otel", "bus-proxy-telemetry/otlp", "dep:reqwest"]
+
+[[test]]
+name = "otlp"
+required-features = ["otlp"]
+
 [dependencies]
 bus-proxy-gateway.workspace = true
 bus-proxy-router.workspace = true
@@ -14,13 +23,10 @@ tracing-subscriber.workspace = true
 clap.workspace = true
 libc = "0.2"
 serde_json.workspace = true
-opentelemetry = { version = "0.33.1", default-features = false, features = ["trace"] }
-opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["trace"] }
-opentelemetry-otlp = { version = "0.33.1", default-features = false, features = ["trace", "http-proto", "http-json", "reqwest-blocking-client"] }
+bus-proxy-telemetry = { workspace = true, optional = true }
 # Reuse the gateway's ring provider rather than enabling a second rustls provider.
-reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "blocking"], optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
-tracing-opentelemetry = { version = "0.34", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"

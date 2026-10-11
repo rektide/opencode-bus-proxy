@@ -186,6 +186,22 @@ missed events cannot be recovered by retaining a downstream socket.
 
 ## OTLP trace export
 
+Packaging is opt-in as well as runtime opt-in. Default workspace builds select
+the four core packages and the daemon's empty default feature set, without OTel
+or reqwest export dependencies. Build a collector-capable binary with
+`cargo build --release --locked -p opencode-bus-proxy --features otlp`.
+The additive `otel` feature selects composition only; `otlp` selects its backend.
+Without `otlp`, explicit exporter selection or endpoint inference fails startup
+with an actionable rebuild instruction. `OTEL_SDK_DISABLED=true` and
+`OTEL_TRACES_EXPORTER=none` still take precedence. Unknown exporter names fail;
+no ClickHouse exporters or selection extensions are implemented yet.
+
+Reusable provider/layer policy lives at `telemetry/core/` (`bus-proxy-telemetry`),
+not in gateway/router. Environment and credential resolution, TLS global policy,
+subscriber installation, supervision and shutdown remain daemon-owned. Blocking
+client/provider initialization and final drain run outside application workers.
+The development toolchain is pinned to 1.98.0; no lower MSRV is advertised.
+
 The daemon can batch-export its existing `tracing` spans and their events over
 OTLP/HTTP. Export is opt-in: set a collector endpoint or `OTEL_TRACES_EXPORTER=otlp`.
 For example, in the service's environment:
@@ -306,7 +322,7 @@ configuration. It starts no managed service and executes no model calls. Set
 and Rust copies of `event-scope-v1.json` are identical, and that ordinary clients
 and updated native decoders handle scoped events through the same routes.
 
-The router's release benchmark is in `crates/router/examples/routing_bench.rs`:
+The router's release benchmark is in `components/router/examples/routing_bench.rs`:
 
 ```sh
 cargo run --release --locked -p bus-proxy-router --example routing_bench -- 128 20000 512

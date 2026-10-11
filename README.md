@@ -66,7 +66,14 @@ drain/drop, and adjust waiting-frame targets live, including zero.
 
 ## Inspect
 
-Optional OTLP trace export: set `OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318`.
+Default builds are local-only: no OpenTelemetry SDK, OTLP or exporter HTTP client.
+For optional OTLP trace export, build with
+`cargo build --release --locked -p opencode-bus-proxy --features otlp`, then set
+`OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318`.
+`otel` enables reusable composition without an OTLP backend; it does not make
+OTLP available. Requesting OTLP in a build without `otlp` fails with a rebuild
+instruction, unless explicitly disabled. The library lives in the root
+[`telemetry/core`](telemetry/README.md) domain subtree.
 Collector headers, resource attributes, sampling, batching, and independent export
 filtering are described in [OTLP configuration](doc/event-multiplexer/operations.md#otlp-trace-export).
 
@@ -88,16 +95,24 @@ silently losing frames or holding up other clients.
 
 ## Layout and verification
 
-| Crate             | Owns                                                                        |
-| ----------------- | --------------------------------------------------------------------------- |
-| `crates/protocol` | Ordinary scoped events, shared selection contract, control and SSE decoding |
-| `crates/router`   | Session index, atomic interest replacement, bounded queues, epochs          |
-| `crates/gateway`  | Authentication, source lifecycle, HTTP and WebSocket transport              |
-| `crates/daemon`   | CLI, tracing, process supervision and shutdown, systemd integration        |
+| Crate                 | Owns                                                                        |
+| --------------------- | --------------------------------------------------------------------------- |
+| `components/protocol` | Ordinary scoped events, shared selection contract, control and SSE decoding |
+| `components/router`   | Session index, atomic interest replacement, bounded queues, epochs          |
+| `components/gateway`  | Authentication, source lifecycle, HTTP and WebSocket transport              |
+| `cli/daemon`          | CLI, tracing, process supervision and shutdown, systemd integration         |
+| `telemetry/core`      | Caller-owned typed telemetry configuration, layers and provider composition |
+
+Package and Rust API names are unchanged. Older design and verification records
+may retain the former `crates/` coordinates; current source navigation uses the
+paths above. The four core packages remain the default workspace members;
+telemetry is selected explicitly by package or daemon feature.
 
 ```sh
-cargo test --workspace --locked
-cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --locked
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --workspace --all-features --locked
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo fmt --all -- --check
 cargo build --locked
 bun run test/compatibility/clients.ts
