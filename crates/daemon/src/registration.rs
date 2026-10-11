@@ -20,7 +20,17 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 use uuid::Uuid;
 
+pub mod watch;
+
 use crate::Result;
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum, PartialEq, Eq)]
+pub enum Mode {
+    /// Supplement endpoints, leaving the publisher's contact URL unchanged.
+    Cooperate,
+    /// Reapply this gateway's contact URL whenever the origin republishes.
+    Stomp,
+}
 
 const MAX_RECORD_BYTES: u64 = 64 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -52,6 +62,24 @@ struct Contribution {
     token: String,
     #[serde(rename = "originUrl")]
     origin_url: String,
+    #[serde(
+        rename = "previousUrl",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    previous_url: Option<String>,
+    #[serde(rename = "addedDiscovery", default)]
+    added_discovery: bool,
+    #[serde(rename = "addedProxy", default)]
+    added_proxy: bool,
+    #[serde(
+        rename = "previousProxyPid",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    previous_proxy_pid: Option<u32>,
+    #[serde(rename = "proxyEndpoint", default = "proxy_endpoint")]
+    proxy_endpoint: String,
 }
 
 struct Owned {
@@ -72,25 +100,26 @@ pub struct Registration {
     // Retained for the process lifetime, including shutdown restoration. The
     // file itself stays: unlinking a locked file breaks cross-process locking.
     _lock: File,
+    mode: Mode,
+    metadata: bool,
 }
 
 impl Registration {
     pub fn new(
         file: PathBuf,
-        upstream: &str,
+        config: &bus_proxy_gateway::Config,
         advertised: Option<&str>,
         address: SocketAddr,
-        username: &str,
-        password: Option<String>,
-        timeout: Duration,
+        mode: Mode,
+        metadata: bool,
     ) -> Result<Self> {
         if !file.is_absolute() {
             return Err("--service-file must be an absolute path".into());
         }
-        if username != "opencode" {
+        if config.username != "opencode" {
             return Err("native discovery requires --username opencode".into());
         }
-        let upstream = origin_url(upstream)?;
+        let upstream = origin_url(&config.upstream)?;
         // This is a local discovery contribution, not a remote service registry.
         // Limiting upstream to HTTP also avoids adding another TLS/auth policy.
         if upstream.scheme() != "http" || !local_host(&upstream) {
@@ -127,25 +156,58 @@ impl Registration {
             file,
             upstream,
             advertised,
-            password,
+            password: config.password.clone(),
             token: Uuid::new_v4().to_string(),
             pid: std::process::id(),
-            timeout,
+            timeout: config.request_timeout,
             client: Client::builder(TokioExecutor::new()).build_http(),
             owned: None,
             _lock: lock,
+            mode,
+            metadata,
         })
     }
 
-    pub async fn run(mut self, shutdown: CancellationToken) {
+    pub async fn run(mut self, shutdown: CancellationToken, watcher: Option<watch::Options>) {
+        let (events, mut changes) = tokio::sync::mpsc::channel(8);
+        let watching = watcher.map(|options| {
+            tokio::spawn(watch::supervise(
+                options,
+                self.file.clone(),
+                events,
+                shutdown.clone(),
+            ))
+        });
         let mut ticks = tokio::time::interval(POLL_INTERVAL);
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut failed = false;
+        let mut watch_ready = false;
+        let mut watch_open = watching.is_some();
+        let mut safety_ticks = 0u32;
         loop {
             tokio::select! {
                 biased;
                 _ = shutdown.cancelled() => break,
-                _ = ticks.tick() => {},
+                event = changes.recv(), if watch_open => {
+                    match event {
+                        Some(watch::Event::Ready) => {
+                            watch_ready = true;
+                            tracing::info!("Effect discovery watcher ready");
+                        },
+                        Some(watch::Event::Change) => {},
+                        Some(watch::Event::Failed) => watch_ready = false,
+                        Some(watch::Event::Disabled) => {
+                            watch_ready = false;
+                            tracing::info!("Effect discovery watcher disabled; using polling");
+                        },
+                        None => { watch_ready = false; watch_open = false; },
+                    }
+                },
+                _ = ticks.tick() => {
+                    safety_ticks += 1;
+                    if watch_ready && self.owned.is_some() && safety_ticks < 30 { continue; }
+                    safety_ticks = 0;
+                },
             }
             let result = tokio::select! {
                 biased;
@@ -164,6 +226,9 @@ impl Registration {
         }
         if let Err(error) = self.restore() {
             tracing::warn!(%error, "native discovery origin restoration failed");
+        }
+        if let Some(task) = watching {
+            let _ = task.await;
         }
     }
 
@@ -196,6 +261,7 @@ impl Registration {
             if marker.format != 1
                 || marker.pid == 0
                 || marker.token.is_empty()
+                || !matches!(marker.proxy_endpoint.as_str(), "proxy" | "busProxy")
                 || process_alive(marker.pid)
                 || origin_url(&record.url).ok().as_ref() != Some(&self.advertised)
             {
@@ -203,10 +269,19 @@ impl Registration {
             }
             // Recovery from SIGKILL/crash: only a dead contributor for this
             // listener and configured origin can be reclaimed.
-            record.url = marker.origin_url.clone();
+            record.url = marker
+                .previous_url
+                .as_ref()
+                .unwrap_or(&marker.origin_url)
+                .clone();
+            recover_metadata(&mut record.extra, marker);
             record.contribution = None;
         }
-        let Ok(origin) = origin_url(&record.url) else {
+        let Some(origin_url_value) = candidate_origin(&record, &self.advertised, &self.upstream)
+        else {
+            return Ok(());
+        };
+        let Ok(origin) = origin_url(&origin_url_value) else {
             return Ok(());
         };
         if !same_origin(&origin, &self.upstream) || record.password != self.password {
@@ -216,19 +291,35 @@ impl Registration {
             return Ok(());
         }
         let original = record.clone();
-        record.url = self.advertised.as_str().trim_end_matches('/').to_owned();
-        record.contribution = Some(Contribution {
+        let mut marker = Contribution {
             format: 1,
             pid: self.pid,
             token: self.token.clone(),
-            origin_url: original.url.clone(),
-        });
+            origin_url: origin_url_value,
+            previous_url: Some(original.url.clone()),
+            added_discovery: false,
+            added_proxy: false,
+            previous_proxy_pid: None,
+            proxy_endpoint: proxy_endpoint(),
+        };
+        if self.metadata && !enrich(&mut record, &self.advertised, &mut marker) {
+            return Ok(());
+        }
+        if self.mode == Mode::Stomp {
+            record.url = self.advertised.as_str().trim_end_matches('/').to_owned();
+        }
+        // Metadata disabled in cooperative mode means no contribution at all.
+        if self.mode == Mode::Cooperate && !self.metadata {
+            return Ok(());
+        }
+        record.contribution = Some(marker);
         let replacement = serde_json::to_vec(&record)?;
         if replace_if_unchanged(&self.file, &bytes, &replacement)? {
             tracing::info!(
                 origin_pid = record.pid,
                 proxy_pid = self.pid,
-                "native discovery now routes through gateway"
+                mode = ?self.mode,
+                "native discovery contribution published"
             );
             self.owned = Some(Owned {
                 bytes: replacement,
@@ -296,6 +387,124 @@ impl Registration {
         }
         Ok(())
     }
+}
+
+/// Markup is descriptive. Only the service endpoint identifies the authorized
+/// upstream; unknown versions/shapes are never overwritten by this daemon.
+fn candidate_origin(record: &Record, advertised: &Url, upstream: &Url) -> Option<String> {
+    if let Some(discovery) = record.extra.get("discovery") {
+        if discovery.get("version")?.as_u64()? != 1 {
+            return None;
+        }
+        let endpoints = discovery.get("endpoints")?.as_object()?;
+        let service = endpoints.get("service")?;
+        if service
+            .get("pid")
+            .is_some_and(|pid| pid.as_u64() != Some(record.pid.into()))
+        {
+            return None;
+        }
+        return service.get("url")?.as_str().map(str::to_owned);
+    }
+    let contact = origin_url(&record.url).ok()?;
+    if same_origin(&contact, upstream) {
+        return Some(record.url.clone());
+    }
+    // A native publisher can disable markup while publishing this listener.
+    // Binding and the subsequent forwarded identity probe establish the route.
+    if contact == *advertised {
+        return Some(upstream.as_str().trim_end_matches('/').to_owned());
+    }
+    None
+}
+
+fn enrich(record: &mut Record, advertised: &Url, marker: &mut Contribution) -> bool {
+    marker.added_discovery = !record.extra.contains_key("discovery");
+    let discovery = record.extra.entry("discovery".into()).or_insert_with(|| {
+        serde_json::json!({
+            "version":1, "source":"daemon", "endpoints":{
+                "service":{"url":marker.origin_url,"pid":record.pid}
+            }
+        })
+    });
+    let Some(endpoints) = discovery
+        .get_mut("endpoints")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return false;
+    };
+    if endpoints
+        .get("proxy")
+        .and_then(|proxy| proxy.get("url"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(|url| origin_url(url).ok())
+        .as_ref()
+        .is_some_and(|url| url != advertised)
+    {
+        // Keep another publisher-described proxy URL explicitly known; this
+        // gateway is an additional endpoint, not a deletion of that knowledge.
+        marker.proxy_endpoint = "busProxy".into();
+    }
+    marker.added_proxy = !endpoints.contains_key(&marker.proxy_endpoint);
+    let proxy = endpoints
+        .entry(&marker.proxy_endpoint)
+        .or_insert_with(|| serde_json::json!({"url":advertised.as_str().trim_end_matches('/')}));
+    let Some(proxy) = proxy.as_object_mut() else {
+        return false;
+    };
+    if proxy
+        .get("url")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|url| origin_url(url).ok())
+        .as_ref()
+        != Some(advertised)
+    {
+        return false; // Do not steal another explicitly described proxy endpoint.
+    }
+    marker.previous_proxy_pid = proxy
+        .get("pid")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|pid| u32::try_from(pid).ok());
+    if proxy.contains_key("pid") && marker.previous_proxy_pid.is_none() {
+        return false;
+    }
+    proxy.insert("pid".into(), marker.pid.into());
+    true
+}
+
+fn recover_metadata(extra: &mut BTreeMap<String, serde_json::Value>, marker: &Contribution) {
+    if marker.added_discovery {
+        extra.remove("discovery");
+        return;
+    }
+    let Some(endpoints) = extra
+        .get_mut("discovery")
+        .and_then(|value| value.get_mut("endpoints"))
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    if marker.added_proxy {
+        endpoints.remove(&marker.proxy_endpoint);
+        return;
+    }
+    if let Some(proxy) = endpoints
+        .get_mut(&marker.proxy_endpoint)
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        match marker.previous_proxy_pid {
+            Some(pid) => {
+                proxy.insert("pid".into(), pid.into());
+            }
+            None => {
+                proxy.remove("pid");
+            }
+        }
+    }
+}
+
+fn proxy_endpoint() -> String {
+    "proxy".into()
 }
 
 fn origin_url(value: &str) -> Result<Url> {

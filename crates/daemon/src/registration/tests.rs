@@ -78,12 +78,16 @@ impl Fixture {
         });
         let registration = Registration::new(
             directory.path().join("service-local.json"),
-            "http://127.0.0.1:49373",
+            &bus_proxy_gateway::Config {
+                upstream: "http://127.0.0.1:49373".into(),
+                password: Some("test-secret".into()),
+                request_timeout: Duration::from_secs(1),
+                ..Default::default()
+            },
             None,
             address,
-            "opencode",
-            Some("test-secret".into()),
-            Duration::from_secs(1),
+            Mode::Stomp,
+            true,
         )
         .unwrap();
         Self {
@@ -178,6 +182,162 @@ async fn publication_preserves_origin_identity_unknown_fields_and_private_permis
     assert_eq!(
         fixture.requests.read().await.as_slice(),
         ["/api/info", "/_bus/health"]
+    );
+    fixture.registration.restore().unwrap();
+    assert_eq!(fixture.read(), original);
+}
+
+#[tokio::test]
+async fn cooperate_only_supplements_and_preserves_native_override_policy() {
+    let mut fixture = Fixture::new().await;
+    fixture.registration.mode = Mode::Cooperate;
+    for contact in ["service", "proxy", "override"] {
+        let mut original = fixture.origin();
+        let advertised = fixture
+            .registration
+            .advertised
+            .as_str()
+            .trim_end_matches('/');
+        original["discovery"] = serde_json::json!({
+            "version":1, "source":contact, "future":"keep", "endpoints":{
+                "service":{"url":original["url"],"pid":123},
+                "proxy":{"url":advertised,"description":"preserve"},
+                "tunnel":{"url":"https://future.test"}
+            }
+        });
+        if contact == "proxy" {
+            original["url"] = advertised.into();
+        }
+        if contact == "override" {
+            original["url"] = "http://localhost:32123".into();
+        }
+        fixture.write(&original);
+        fixture.registration.reconcile().await.unwrap();
+        let actual = fixture.read();
+        assert_eq!(actual["url"], original["url"]);
+        assert_eq!(
+            actual["discovery"]["endpoints"]["proxy"]["pid"],
+            std::process::id()
+        );
+        assert_eq!(
+            actual["discovery"]["endpoints"]["tunnel"],
+            original["discovery"]["endpoints"]["tunnel"]
+        );
+        assert_eq!(actual["discovery"]["future"], "keep");
+        assert_eq!(
+            actual["discovery"]["endpoints"]["proxy"]["description"],
+            "preserve"
+        );
+        fixture.registration.restore().unwrap();
+        assert_eq!(fixture.read(), original);
+    }
+    fixture.registration.metadata = false;
+    let before = fixture.write(&fixture.origin());
+    fixture.registration.reconcile().await.unwrap();
+    assert_eq!(read_record(&fixture.registration.file).unwrap(), before);
+}
+
+#[tokio::test]
+async fn stomp_reapplies_native_publishing_and_recreation_without_self_write_churn() {
+    let mut fixture = Fixture::new().await;
+    let mut original = fixture.origin();
+    original["discovery"] = serde_json::json!({"version":1,"source":"override","endpoints":{
+        "service":{"url":original["url"],"pid":123},
+        "override":{"url":"http://localhost:32123"}
+    }});
+    original["url"] = "http://localhost:32123".into();
+    for _ in 0..3 {
+        let temporary = fixture._directory.path().join("publisher.tmp");
+        std::fs::write(&temporary, serde_json::to_vec(&original).unwrap()).unwrap();
+        std::fs::rename(temporary, &fixture.registration.file).unwrap();
+        fixture.registration.reconcile().await.unwrap();
+        assert_eq!(
+            fixture.read()["url"],
+            fixture
+                .registration
+                .advertised
+                .as_str()
+                .trim_end_matches('/')
+        );
+        let before = std::fs::metadata(&fixture.registration.file)
+            .unwrap()
+            .modified()
+            .unwrap();
+        for _ in 0..5 {
+            fixture.registration.reconcile().await.unwrap();
+        }
+        assert_eq!(
+            std::fs::metadata(&fixture.registration.file)
+                .unwrap()
+                .modified()
+                .unwrap(),
+            before
+        );
+        assert_eq!(
+            fixture.read()["discovery"]["endpoints"]["override"],
+            original["discovery"]["endpoints"]["override"]
+        );
+    }
+    std::fs::remove_file(&fixture.registration.file).unwrap();
+    fixture.registration.reconcile().await.unwrap();
+    assert!(fixture.registration.owned.is_none());
+    assert!(!fixture.registration.file.exists());
+    fixture.write(&original);
+    fixture.registration.reconcile().await.unwrap();
+    fixture.registration.restore().unwrap();
+    assert_eq!(fixture.read(), original);
+}
+
+#[tokio::test]
+async fn dead_daemon_recovery_retains_the_publishers_proxy_route_and_metadata() {
+    let mut fixture = Fixture::new().await;
+    let mut original = fixture.origin();
+    let advertised = fixture
+        .registration
+        .advertised
+        .as_str()
+        .trim_end_matches('/');
+    original["discovery"] = serde_json::json!({"version":1,"source":"proxy","endpoints":{
+        "service":{"url":original["url"],"pid":123}, "proxy":{"url":advertised}
+    }});
+    original["url"] = advertised.into();
+    fixture.write(&original);
+    fixture.registration.reconcile().await.unwrap();
+    let mut stale = fixture.read();
+    stale["_busProxy"]["pid"] = 2_000_000_000u32.into();
+    stale["discovery"]["endpoints"]["proxy"]["pid"] = 2_000_000_000u32.into();
+    fixture.write(&stale);
+    fixture.registration.reconcile().await.unwrap();
+    fixture.registration.restore().unwrap();
+    assert_eq!(fixture.read(), original);
+}
+
+#[tokio::test]
+async fn stomp_preserves_another_known_proxy_endpoint_instead_of_becoming_a_noop() {
+    let mut fixture = Fixture::new().await;
+    let mut original = fixture.origin();
+    original["discovery"] = serde_json::json!({"version":1,"source":"proxy","endpoints":{
+        "service":{"url":original["url"],"pid":123}, "proxy":{"url":"http://127.0.0.1:32123","note":"another known contact"}
+    }});
+    original["url"] = "http://127.0.0.1:32123".into();
+    fixture.write(&original);
+    fixture.registration.reconcile().await.unwrap();
+    let actual = fixture.read();
+    assert_eq!(
+        actual["url"],
+        fixture
+            .registration
+            .advertised
+            .as_str()
+            .trim_end_matches('/')
+    );
+    assert_eq!(
+        actual["discovery"]["endpoints"]["proxy"],
+        original["discovery"]["endpoints"]["proxy"]
+    );
+    assert_eq!(
+        actual["discovery"]["endpoints"]["busProxy"]["pid"],
+        std::process::id()
     );
     fixture.registration.restore().unwrap();
     assert_eq!(fixture.read(), original);
@@ -323,12 +483,15 @@ async fn locking_configuration_symlinks_and_size_fail_closed() {
     let create = |file: PathBuf, upstream: &str, advertised: Option<&str>, username: &str| {
         Registration::new(
             file,
-            upstream,
+            &bus_proxy_gateway::Config {
+                upstream: upstream.into(),
+                username: username.into(),
+                ..Default::default()
+            },
             advertised,
             "127.0.0.1:32123".parse().unwrap(),
-            username,
-            None,
-            Duration::from_secs(1),
+            Mode::Cooperate,
+            true,
         )
     };
     assert!(

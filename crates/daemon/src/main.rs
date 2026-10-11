@@ -48,6 +48,31 @@ struct Arguments {
     #[arg(long, env = "BUS_PROXY_SERVICE_URL", requires = "service_file")]
     service_url: Option<String>,
 
+    /// Cooperate supplements endpoints; stomp also reapplies this gateway's contact URL.
+    #[arg(
+        long,
+        env = "BUS_PROXY_SERVICE_MODE",
+        value_enum,
+        default_value = "cooperate"
+    )]
+    service_mode: registration::Mode,
+
+    /// Include public service/proxy endpoint descriptions (no additional secrets).
+    #[arg(long, env = "BUS_PROXY_SERVICE_METADATA", default_value_t = true, action = clap::ArgAction::Set)]
+    service_metadata: bool,
+
+    /// Bun invalidation helper reusing the existing Effect watcher (optional).
+    #[arg(long, env = "BUS_PROXY_SERVICE_WATCH_HELPER", requires_all = ["service_file", "service_watch_source"])]
+    service_watch_helper: Option<PathBuf>,
+
+    /// OpenCode source root containing effect-watch's util modules.
+    #[arg(
+        long,
+        env = "BUS_PROXY_SERVICE_WATCH_SOURCE",
+        requires = "service_watch_helper"
+    )]
+    service_watch_source: Option<PathBuf>,
+
     /// Explicitly allow an origin and gateway without authentication.
     #[arg(long)]
     allow_unauthenticated: bool,
@@ -184,12 +209,11 @@ async fn main() -> Result<()> {
         .map(|file| {
             registration::Registration::new(
                 file,
-                &config.upstream,
+                &config,
                 args.service_url.as_deref(),
                 address,
-                &config.username,
-                config.password.clone(),
-                config.request_timeout,
+                args.service_mode,
+                args.service_metadata,
             )
         })
         .transpose()?;
@@ -202,8 +226,16 @@ async fn main() -> Result<()> {
         shutdown.clone(),
     ));
     tracing::info!(%address, "event gateway listening");
-    let mut registration =
-        registration.map(|registration| tokio::spawn(registration.run(shutdown.clone())));
+    let mut registration = registration.map(|registration| {
+        tokio::spawn(
+            registration.run(
+                shutdown.clone(),
+                args.service_watch_helper
+                    .zip(args.service_watch_source)
+                    .map(|(helper, source)| registration::watch::Options { helper, source }),
+            ),
+        )
+    });
     let _ = systemd::notify(
         notify_socket.as_deref(),
         &format!("READY=1\nSTATUS=event gateway on {address}"),
@@ -255,10 +287,10 @@ async fn main() -> Result<()> {
     let _ = systemd::notify(notify_socket.as_deref(), "STOPPING=1");
     shutdown.cancel();
     tracing::info!("event gateway stopping");
-    if !matches!(stopped, Stopped::Registration(_)) {
-        if let Some(task) = &mut registration {
-            join_shutdown(task).await?;
-        }
+    if !matches!(stopped, Stopped::Registration(_))
+        && let Some(task) = &mut registration
+    {
+        join_shutdown(task).await?;
     }
     match stopped {
         Stopped::Signal(result) => {
