@@ -146,6 +146,80 @@ async fn connection_limits_must_be_positive() {
 type Body = UnsyncBoxBody<Bytes, Error>;
 
 #[tokio::test]
+async fn reused_hyper_sse_has_an_explicit_nontransferable_subscription_association() {
+    let harness = Harness::new().await;
+    harness.ready().await;
+    let address = harness.base.strip_prefix("http://").unwrap();
+    let socket = TcpStream::connect(address).await.unwrap();
+    let (mut client, connection) = hyper::client::conn::http1::handshake(TokioIo::new(socket))
+        .await
+        .unwrap();
+    tokio::spawn(connection);
+    let request = |path| {
+        Request::builder()
+            .uri(path)
+            .header("host", address)
+            .header(
+                "authorization",
+                format!("Basic {}", STANDARD.encode("opencode:secret")),
+            )
+            .body(Full::new(Bytes::new()))
+            .unwrap()
+    };
+    client
+        .send_request(request("/_bus/health"))
+        .await
+        .unwrap()
+        .into_body()
+        .collect()
+        .await
+        .unwrap();
+    let mut body = client
+        .send_request(request("/api/experimental/event"))
+        .await
+        .unwrap()
+        .into_body();
+    let mut decoder = SseDecoder::new(1024 * 1024);
+    let id = loop {
+        let frame = body.frame().await.unwrap().unwrap();
+        if let Ok(data) = frame.into_data()
+            && let Some(frame) = decoder.push(&data).unwrap().into_iter().next()
+        {
+            let ready: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+            break ready["data"]["subscriptionID"].as_str().unwrap().to_owned();
+        }
+    };
+    let mut request = harness.request("GET", "/_bus/handover", full(Bytes::new()));
+    request
+        .headers_mut()
+        .insert("origin", "http://localhost:1".parse().unwrap());
+    let response = harness.client.request(request).await.unwrap();
+    assert_eq!(
+        response.headers()["access-control-allow-origin"],
+        "http://localhost:1"
+    );
+    let value: serde_json::Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let connection = value["connections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["subscription"] == id)
+        .unwrap();
+    assert_eq!(connection["role"], "opaque_http1_sse");
+    assert_eq!(connection["capability"], "unsupported");
+    assert!(
+        value["routing"]["subscriptions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["id"] == id && s["active"] == false)
+    );
+    drop(body);
+    harness.close().await;
+}
+
+#[tokio::test]
 async fn queue_policy_control_is_authenticated_bounded_cors_compatible_and_inspectable() {
     let harness = Harness::new().await;
     let mut unauthorized = harness.request("PUT", "/_bus/queue", full("{\"frames\":0}"));

@@ -526,6 +526,13 @@ async fn handle(mut request: Request<Incoming>, state: Arc<State>) -> Response<B
         };
         match state.router.subscribe(mode).await {
             Ok(subscription) => {
+                if let Some(registration) =
+                    request.extensions().get::<Arc<transport::Registration>>()
+                {
+                    state
+                        .registry
+                        .opaque_sse(&registration.1, subscription.id());
+                }
                 let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
                 heartbeat.tick().await;
                 let stream = futures_util::stream::try_unfold(
@@ -598,7 +605,14 @@ async fn handle(mut request: Request<Incoming>, state: Arc<State>) -> Response<B
         queue_policy(&mut request, &state).await
     } else if request.method() == Method::GET && path.starts_with("/_bus/") {
         if path == "/_bus/handover" {
-            json(StatusCode::OK, state.registry.inspect(&state))
+            match state.router.snapshot().await {
+                Ok(snapshot) => {
+                    let mut value = state.registry.inspect(&state);
+                    value["routing"] = serde_json::to_value(snapshot).unwrap();
+                    json(StatusCode::OK, value)
+                }
+                Err(error) => router_error(error, ""),
+            }
         } else {
             match state.router.snapshot().await {
                 Ok(snapshot) => {

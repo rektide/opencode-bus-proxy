@@ -153,6 +153,100 @@ async fn credits(router: &Router, ids: &[&str]) {
 }
 
 #[tokio::test]
+async fn source_loss_while_parked_retires_inherited_ids_instead_of_claiming_continuity() {
+    let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let config = Config {
+        upstream: format!("http://{}", origin.local_addr().unwrap()),
+        ..Config::default()
+    };
+    let stop = CancellationToken::new();
+    let (router, routing) = Router::spawn(Limits::default(), stop.clone()).unwrap();
+    let (control, receiver) = handover::channel();
+    let gateway = tokio::spawn(serve_with_handover(
+        listener,
+        config.clone(),
+        router.clone(),
+        stop.clone(),
+        receiver,
+        None,
+    ));
+    let (mut source, _) = origin.accept().await.unwrap();
+    let mut request = Vec::new();
+    while !request.ends_with(b"\r\n\r\n") {
+        request.push(source.read_u8().await.unwrap());
+    }
+    source.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nOpenCode-Event-Scope: 1\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
+    source
+        .write_all(&chunk(
+            b"data: {\"type\":\"server.connected\",\"id\":\"evt_loss\"}\n\n",
+        ))
+        .await
+        .unwrap();
+    while router.snapshot().await.unwrap().epoch.is_none() {
+        tokio::task::yield_now().await;
+    }
+    let mut feed = Feed::open(address, true).await;
+    let id = feed.next().await["data"]["subscriptionID"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let frozen = control.freeze().await.unwrap();
+    let image = handover::decode(&handover::encode(frozen.image()).unwrap()).unwrap();
+    let mut fds: HashMap<_, _> = frozen.descriptors().unwrap().into_iter().collect();
+    let listener = std::net::TcpListener::from(fds.remove("listener").unwrap());
+    listener.set_nonblocking(true).unwrap();
+    drop(source); // The origin fails after the cut. The successor must notice FIN.
+    stop.cancel();
+    gateway.await.unwrap().unwrap();
+    routing.await.unwrap();
+    drop(frozen);
+    let stop = CancellationToken::new();
+    let (router, routing, imported) = image
+        .import(&config, Limits::default(), fds, stop.clone())
+        .unwrap();
+    let (_, receiver) = handover::channel();
+    let gateway = tokio::spawn(serve_with_handover(
+        TcpListener::from_std(listener).unwrap(),
+        config,
+        router.clone(),
+        stop.clone(),
+        receiver,
+        Some(imported),
+    ));
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(3), feed.body.frame())
+            .await
+            .unwrap(),
+        Some(Err(_))
+    ));
+    assert_eq!(router.snapshot().await.unwrap().counters.epochs_ended, 1);
+    let (mut fresh, _) = tokio::time::timeout(Duration::from_secs(3), origin.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut request = Vec::new();
+    while !request.ends_with(b"\r\n\r\n") {
+        request.push(fresh.read_u8().await.unwrap());
+    }
+    fresh.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nOpenCode-Event-Scope: 1\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
+    fresh
+        .write_all(&chunk(
+            b"data: {\"type\":\"server.connected\",\"id\":\"evt_fresh\"}\n\n",
+        ))
+        .await
+        .unwrap();
+    while router.snapshot().await.unwrap().epoch.is_none() {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(put(address, &id, &["ses_a"]).await, 404);
+    stop.cancel();
+    gateway.await.unwrap().unwrap();
+    routing.await.unwrap();
+}
+
+#[tokio::test]
 async fn boundary_drain_preserves_ready_clients_zero_policy_and_source_but_closes_stalled_client() {
     let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

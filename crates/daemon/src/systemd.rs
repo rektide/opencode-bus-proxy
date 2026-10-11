@@ -42,6 +42,29 @@ pub(crate) fn requested(
 /// non-socket or unbound handovers (for example a ListenFIFO= unit) with an
 /// actionable error.
 pub(crate) fn adopt(fd: OwnedFd) -> io::Result<(TcpListener, SocketAddr)> {
+    let mut kind: libc::c_int = 0;
+    let mut protocol: libc::c_int = 0;
+    let mut size = std::mem::size_of_val(&kind) as libc::socklen_t;
+    for (property, expected, value) in [
+        (libc::SO_TYPE, libc::SOCK_STREAM, &mut kind),
+        (libc::SO_PROTOCOL, libc::IPPROTO_TCP, &mut protocol),
+    ] {
+        if unsafe {
+            libc::getsockopt(
+                fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                property,
+                (value as *mut libc::c_int).cast(),
+                &mut size,
+            )
+        } < 0
+            || *value != expected
+        {
+            return Err(io::Error::other(
+                "activated descriptor is not TCP; configure ListenStream=",
+            ));
+        }
+    }
     let mut listening: libc::c_int = 0;
     let mut length = std::mem::size_of_val(&listening) as libc::socklen_t;
     if unsafe {

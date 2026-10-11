@@ -86,6 +86,10 @@ impl Registry {
     pub(crate) fn remove(&self, key: &str) {
         self.connections.lock().unwrap().remove(key);
     }
+    pub(crate) fn opaque_sse(&self, key: &str, subscription: &str) {
+        self.connections.lock().unwrap().insert(key.into(), serde_json::json!({"connection":key,"subscription":subscription,
+            "role":"opaque_http1_sse","capability":"unsupported","reason":"hyper_owned_response_on_reused_or_noneligible_connection"}));
+    }
     pub(crate) fn inspect(&self, state: &State) -> serde_json::Value {
         let mut connections: Vec<_> = self.connections.lock().unwrap().values().cloned().collect();
         connections.sort_by(|a, b| a["connection"].as_str().cmp(&b["connection"].as_str()));
@@ -321,6 +325,20 @@ impl Image {
             {
                 return Err(invalid());
             }
+            let mut protocol: libc::c_int = 0;
+            if unsafe {
+                libc::getsockopt(
+                    fd.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_PROTOCOL,
+                    (&mut protocol as *mut libc::c_int).cast(),
+                    &mut length,
+                )
+            } < 0
+                || protocol != libc::IPPROTO_TCP
+            {
+                return Err(invalid());
+            }
             let stream = std::net::TcpStream::from(fd);
             if stream.local_addr()? != socket.local || stream.peer_addr()? != socket.peer {
                 return Err(invalid());
@@ -502,6 +520,7 @@ pub(crate) async fn run(
         progress.mode = Some(imported.mode);
         progress.kept = imported.clients.len();
         progress.dropped = imported.dropped;
+        progress.clients = progress.kept.saturating_add(progress.dropped);
         publish_progress(&state, &control.1, &progress);
         state
             .metrics
