@@ -1,6 +1,6 @@
 [workspace]
-members = ["crates/protocol", "crates/router", "crates/gateway", "crates/daemon", "telemetry/core"]
-default-members = ["crates/protocol", "crates/router", "crates/gateway", "crates/daemon"]
+members = ["components/protocol", "components/router", "components/gateway", "cli/daemon", "telemetry/core"]
+default-members = ["components/protocol", "components/router", "components/gateway", "cli/daemon"]
 resolver = "2"
 
 [workspace.package]
@@ -9,9 +9,9 @@ edition = "2024"
 license = "MIT"
 
 [workspace.dependencies]
-bus-proxy-protocol = { path = "crates/protocol" }
-bus-proxy-router = { path = "crates/router" }
-bus-proxy-gateway = { path = "crates/gateway" }
+bus-proxy-protocol = { path = "components/protocol" }
+bus-proxy-router = { path = "components/router" }
+bus-proxy-gateway = { path = "components/gateway" }
 bus-proxy-telemetry = { path = "telemetry/core", default-features = false }
 opentelemetry = { version = "0.33.1", default-features = false, features = ["trace"] }
 opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["trace"] }
