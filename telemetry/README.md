@@ -76,3 +76,6 @@ The [operations guide](../doc/event-multiplexer/operations.md#native-clickhouse-
 documents build/selection/configuration and operator-owned table provisioning.
 The native library's ignored tests optionally start only their own disposable
 ClickHouse process; no Kubernetes/Docker deployment or existing database is used.
+The [native verification report](native-verification.sol61x.md) records executed
+feature/consumer/server checks and the exact upstream limitations, separate from
+deployment acceptance.
