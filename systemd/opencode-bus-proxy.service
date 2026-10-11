@@ -1,0 +1,70 @@
+# opencode-bus-proxy.service - production-hardened preset for the event
+# gateway.
+#
+# Pairs with opencode-bus-proxy.socket: when the socket unit is enabled it
+# owns the listening socket and this unit adopts it. Without a socket unit,
+# the daemon binds 127.0.0.1:4097 itself and - because this unit is
+# Type=notify with FileDescriptorStoreMax=1 - stores that listener with the
+# service manager, so restarts keep the listening socket and newly accepted
+# connections without a connection-refused window. In both cases the
+# listener reaches the daemon through the same LISTEN_FDS handover, so
+# ExecStart must never pass --listen (the daemon rejects the combination).
+#
+# Install into /etc/systemd/system/ with the socket unit, place the shared
+# origin password at /etc/opencode/server-password (mode 0600, root-owned),
+# install the binary at /usr/local/bin/opencode-bus-proxy, then:
+#
+#   systemctl daemon-reload
+#   systemctl enable --now opencode-bus-proxy.socket
+#
+# or, to run without a socket unit, enable this service directly.
+
+[Unit]
+Description=OpenCode V2 event gateway (bus proxy)
+After=network.target
+
+[Service]
+Type=notify
+WatchdogSec=30
+ExecStart=/usr/local/bin/opencode-bus-proxy --upstream http://127.0.0.1:4096 --credential opencode-password
+LoadCredential=opencode-password:/etc/opencode/server-password
+Restart=on-failure
+RestartSec=2s
+# One slot for the fdstore listener handoff (FDSTORE=1/FDNAME=listener).
+# Harmless under the socket unit, where the manager already holds the
+# listening socket and the daemon does not re-store it.
+FileDescriptorStoreMax=1
+
+# --- Sandboxing ---------------------------------------------------------
+# Transient UID/GID; no persistent identity to compromise or clean up.
+DynamicUser=yes
+NoNewPrivileges=yes
+# The whole filesystem becomes read-only except /dev, /proc, /tmp (private,
+# below); the daemon reads the password through $CREDENTIALS_DIRECTORY,
+# which systemd provisions before dropping privileges.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectHostname=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+# hidepid for this unit's procfs instance.
+ProtectProc=invisible
+# AF_INET/AF_INET6 for the gateway and upstream; AF_UNIX for NOTIFY_SOCKET.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+# No JIT anywhere in the dependency tree (tokio, hyper, regex, ring are
+# interpreted or build-time compiled), so W^X cannot break the daemon.
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

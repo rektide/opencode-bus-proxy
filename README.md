@@ -55,8 +55,9 @@ socket activation (the socket unit's `ListenStream=` owns the address; an
 explicit `--listen` conflicts and is rejected), and `Type=notify` units get
 `READY=1` once serving, `STOPPING=1` at shutdown, and `WatchdogSec=` heartbeats.
 Together with `--credential`, a unit file runs the gateway without secrets in
-argv or the environment — see
-[operations](doc/event-multiplexer/operations.md).
+argv or the environment — a hardened production unit preset ships in
+[`systemd/`](systemd/) (see
+[operations](doc/event-multiplexer/operations.md)).
 
 ## Inspect
 

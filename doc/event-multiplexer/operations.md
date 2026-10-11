@@ -119,6 +119,27 @@ connections survive the restart. Existing streams are live-only and end with
 the process that served them. `systemctl enable --now
 opencode-bus-proxy.socket` starts the service on the first connection.
 
+### Hardened unit preset
+
+The inline units above favor readability. For production, the repository
+ships a hardened preset — [`systemd/opencode-bus-proxy.socket`](../../systemd/opencode-bus-proxy.socket)
+and [`systemd/opencode-bus-proxy.service`](../../systemd/opencode-bus-proxy.service) —
+validated with `systemd-analyze verify`: the service runs as a transient
+`DynamicUser=` with `NoNewPrivileges=`, a read-only filesystem
+(`ProtectSystem=strict`), kernel/interface hardening
+(`ProtectKernelTunables=`, `ProtectKernelModules=`, `ProtectKernelLogs=`,
+`ProtectHostname=`, `ProtectClock=`, `ProtectControlGroups=`, `ProtectProc=invisible`),
+`RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6`, an empty capability
+bounding set, and `SystemCallFilter=@system-service` with
+`SystemCallArchitectures=native`. `MemoryDenyWriteExecute=yes` is safe here:
+nothing in the dependency tree generates native code at runtime (tokio,
+hyper, regex, and ring are interpreted or build-time compiled). Install both
+units into `/etc/systemd/system/`; the service reads the origin password
+through `LoadCredential=` and never sees it in argv or the environment.
+
+The preset also sets `FileDescriptorStoreMax=1`, which pairs with the
+gateway's fdstore handoff — see the next section.
+
 ## Limits and failure behavior
 
 Use `--help` for current defaults. The configurable limits are:

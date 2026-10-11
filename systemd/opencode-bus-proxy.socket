@@ -1,0 +1,24 @@
+# opencode-bus-proxy.socket - socket activation for the event gateway.
+#
+# systemd owns the 127.0.0.1:4097 listening socket and hands it to the
+# service, so service restarts never refuse connections: queued connects
+# wait for the next instance. Install both this unit and
+# opencode-bus-proxy.service into /etc/systemd/system/, then:
+#
+#   systemctl daemon-reload
+#   systemctl enable --now opencode-bus-proxy.socket
+#
+# The daemon starts on the first connection (or immediately with
+# 'systemctl start opencode-bus-proxy.service'). While the socket unit is
+# enabled, ExecStart must not pass --listen: the socket unit owns the
+# address, and the daemon rejects the combination.
+
+[Socket]
+ListenStream=127.0.0.1:4097
+# Event streams are many small writes; Nagle only adds latency.
+NoDelay=true
+# Detect dead peers during quiet SSE periods at the TCP layer.
+KeepAlive=true
+
+[Install]
+WantedBy=sockets.target
