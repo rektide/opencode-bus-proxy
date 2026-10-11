@@ -95,6 +95,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 
 [[package]]
+name = "bus-proxy-discovery"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "bytes",
+ "clap",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "bus-proxy-gateway"
 version = "0.1.0"
 dependencies = [
@@ -148,6 +170,17 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "bus-proxy-service-manager"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]
@@ -768,25 +801,16 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 name = "opencode-bus-proxy"
 version = "0.1.0"
 dependencies = [
- "base64",
+ "bus-proxy-discovery",
  "bus-proxy-gateway",
  "bus-proxy-router",
- "bytes",
+ "bus-proxy-service-manager",
  "clap",
- "http",
- "http-body-util",
- "hyper",
- "hyper-util",
- "libc",
- "serde",
- "serde_json",
  "tempfile",
  "tokio",
  "tokio-util",
  "tracing",
  "tracing-subscriber",
- "url",
- "uuid",
 ]
 
 [[package]]

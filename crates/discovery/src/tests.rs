@@ -78,11 +78,11 @@ impl Fixture {
         });
         let registration = Registration::new(
             directory.path().join("service-local.json"),
-            &bus_proxy_gateway::Config {
-                upstream: "http://127.0.0.1:49373".into(),
-                password: Some("test-secret".into()),
+            &Origin {
+                upstream: "http://127.0.0.1:49373",
+                username: "opencode",
+                password: Some("test-secret"),
                 request_timeout: Duration::from_secs(1),
-                ..Default::default()
             },
             None,
             address,
@@ -502,10 +502,11 @@ async fn locking_configuration_symlinks_and_size_fail_closed() {
     let create = |file: PathBuf, upstream: &str, advertised: Option<&str>, username: &str| {
         Registration::new(
             file,
-            &bus_proxy_gateway::Config {
-                upstream: upstream.into(),
-                username: username.into(),
-                ..Default::default()
+            &Origin {
+                upstream,
+                username,
+                password: None,
+                request_timeout: Duration::from_secs(10),
             },
             advertised,
             "127.0.0.1:32123".parse().unwrap(),

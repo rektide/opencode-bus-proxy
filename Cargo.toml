@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/protocol", "crates/router", "crates/gateway", "crates/daemon"]
+members = ["crates/protocol", "crates/router", "crates/gateway", "crates/service-manager", "crates/discovery", "crates/daemon"]
 resolver = "2"
 
 [workspace.package]
@@ -11,6 +11,8 @@ license = "MIT"
 bus-proxy-protocol = { path = "crates/protocol" }
 bus-proxy-router = { path = "crates/router" }
 bus-proxy-gateway = { path = "crates/gateway" }
+bus-proxy-service-manager = { path = "crates/service-manager" }
+bus-proxy-discovery = { path = "crates/discovery" }
 bytes = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }

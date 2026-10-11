@@ -1,4 +1,4 @@
-//! Process bridge, not another filesystem watcher implementation. Reuses
+//! Discovery process bridge, not another filesystem watcher implementation. Reuses
 //! OpenCode's Effect FileSystemWatchClient in a supervised Bun child.
 use std::{path::PathBuf, process::Stdio, time::Duration};
 

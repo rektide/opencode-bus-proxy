@@ -1,4 +1,4 @@
-//! systemd service-manager integration: socket-activation adoption and
+//! systemd wire protocol: socket-activation adoption and
 //! sd_notify readiness/watchdog/fdstore messages.
 
 use std::{

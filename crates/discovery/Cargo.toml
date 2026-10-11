@@ -1,0 +1,25 @@
+[package]
+name = "bus-proxy-discovery"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+libc = "0.2"
+base64 = "0.22"
+bytes.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+url = "2"
+uuid.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+hyper.workspace = true

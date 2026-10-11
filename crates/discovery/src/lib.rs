@@ -22,7 +22,15 @@ use uuid::Uuid;
 
 pub mod watch;
 
-use crate::Result;
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+/// Origin credentials and request policy needed by local discovery.
+pub struct Origin<'a> {
+    pub upstream: &'a str,
+    pub username: &'a str,
+    pub password: Option<&'a str>,
+    pub request_timeout: Duration,
+}
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum, PartialEq, Eq)]
 pub enum Mode {
@@ -107,7 +115,7 @@ pub struct Registration {
 impl Registration {
     pub fn new(
         file: PathBuf,
-        config: &bus_proxy_gateway::Config,
+        config: &Origin<'_>,
         advertised: Option<&str>,
         address: SocketAddr,
         mode: Mode,
@@ -119,7 +127,7 @@ impl Registration {
         if config.username != "opencode" {
             return Err("native discovery requires --username opencode".into());
         }
-        let upstream = origin_url(&config.upstream)?;
+        let upstream = origin_url(config.upstream)?;
         // This is a local discovery contribution, not a remote service registry.
         // Limiting upstream to HTTP also avoids adding another TLS/auth policy.
         if upstream.scheme() != "http" || !local_host(&upstream) {
@@ -156,7 +164,7 @@ impl Registration {
             file,
             upstream,
             advertised,
-            password: config.password.clone(),
+            password: config.password.map(str::to_owned),
             token: Uuid::new_v4().to_string(),
             pid: std::process::id(),
             timeout: config.request_timeout,
@@ -171,12 +179,12 @@ impl Registration {
     pub async fn run(mut self, shutdown: CancellationToken, watcher: Option<watch::Options>) {
         let (events, mut changes) = tokio::sync::mpsc::channel(8);
         let watching = watcher.map(|options| {
-            tokio::spawn(watch::supervise(
+            tokio_util::task::AbortOnDropHandle::new(tokio::spawn(watch::supervise(
                 options,
                 self.file.clone(),
                 events,
                 shutdown.clone(),
-            ))
+            )))
         });
         let mut ticks = tokio::time::interval(POLL_INTERVAL);
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
