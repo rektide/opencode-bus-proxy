@@ -5,9 +5,9 @@ use bus_proxy_router::{Limits, Router};
 use clap::Parser;
 use tokio::{net::TcpListener, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
-use tracing_subscriber::EnvFilter;
 
 mod systemd;
+mod telemetry;
 
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -96,15 +96,22 @@ fn positive(value: &str) -> std::result::Result<usize, String> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Arguments::parse();
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,hyper=warn,h2=warn"));
-    let subscriber = tracing_subscriber::fmt().with_env_filter(filter);
-    if args.log_json {
-        subscriber.json().try_init()?;
-    } else {
-        subscriber.try_init()?;
+    let activation = systemd::requested(
+        std::env::var("LISTEN_PID").ok().as_deref(),
+        std::env::var("LISTEN_FDS").ok().as_deref(),
+        std::process::id(),
+    )?;
+    if activation {
+        remove_activation_environment();
     }
+    let telemetry = telemetry::init(args.log_json)?;
+    let result = run(args, activation).await;
+    // The batch worker uses blocking HTTP; flush outside Tokio's worker threads.
+    tokio::task::spawn_blocking(move || telemetry.shutdown()).await?;
+    result
+}
 
+async fn run(args: Arguments, activation: bool) -> Result<()> {
     if args.password_file.is_some() && args.credential.is_some() {
         return Err("choose one password source: --password-file or --credential".into());
     }
@@ -135,11 +142,6 @@ async fn main() -> Result<()> {
         header_read_timeout: Duration::from_secs(args.header_read_seconds as u64),
     };
     let notify_socket = std::env::var_os("NOTIFY_SOCKET");
-    let activation = systemd::requested(
-        std::env::var("LISTEN_PID").ok().as_deref(),
-        std::env::var("LISTEN_FDS").ok().as_deref(),
-        std::process::id(),
-    )?;
     let listener = if activation {
         if let Some(address) = args.listen {
             return Err(format!(
@@ -150,7 +152,6 @@ async fn main() -> Result<()> {
         }
         let (listener, address) = systemd::adopt(systemd::activated_fd()?)?;
         tracing::info!(%address, "listener adopted from systemd socket activation");
-        remove_activation_environment();
         TcpListener::from_std(listener)?
     } else {
         let address = args
