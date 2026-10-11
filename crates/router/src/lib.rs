@@ -1154,6 +1154,7 @@ mod tests {
         let (router, task) = Router::spawn(
             Limits {
                 queue_frames: 0,
+                queue_bytes: 256,
                 ..Limits::default()
             },
             stop.clone(),
@@ -1202,6 +1203,53 @@ mod tests {
             "canceling an empty receive revokes credit"
         );
         assert_eq!(router.snapshot().await.unwrap().counters.queue_overflows, 2);
+        let mut byte_limited = router.subscribe(Mode::Legacy).await.unwrap();
+        byte_limited.recv().await.unwrap();
+        let mut receiving = Box::pin(byte_limited.recv());
+        arm(&mut receiving).await;
+        router
+            .publish("one".into(), Route::Broadcast, Bytes::from(vec![b'x'; 257]))
+            .await
+            .unwrap();
+        assert!(
+            receiving.await.is_none(),
+            "direct credit still obeys the byte allowance"
+        );
+        stop.cancel();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn zero_credit_allows_one_delivery_not_an_unbounded_unscheduled_burst() {
+        let (router, stop, task) = router(8).await;
+        router.set_queue_frames(0).await.unwrap();
+        let mut sub = router.subscribe(Mode::Legacy).await.unwrap();
+        sub.recv().await.unwrap();
+        let mut receiving = Box::pin(sub.recv());
+        arm(&mut receiving).await;
+        router
+            .publish(
+                "one".into(),
+                Route::Broadcast,
+                Bytes::from_static(b"one-credit"),
+            )
+            .await
+            .unwrap();
+        router
+            .publish(
+                "one".into(),
+                Route::Broadcast,
+                Bytes::from_static(b"no-second-credit"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            receiving.await.is_none(),
+            "a second unscheduled delivery explicitly retires this subscriber"
+        );
+        let snapshot = router.snapshot().await.unwrap();
+        assert_eq!(snapshot.counters.admissions, 1);
+        assert_eq!(snapshot.counters.queue_overflows, 1);
         stop.cancel();
         task.await.unwrap();
     }
