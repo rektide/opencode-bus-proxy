@@ -1,4 +1,11 @@
-use std::{error::Error, net::SocketAddr, os::fd::AsFd, path::PathBuf, time::Duration};
+use std::{
+    collections::HashMap,
+    error::Error,
+    net::SocketAddr,
+    os::fd::{AsFd, OwnedFd},
+    path::PathBuf,
+    time::Duration,
+};
 
 use bus_proxy_gateway::Config;
 use bus_proxy_router::{Limits, Router};
@@ -6,6 +13,7 @@ use clap::Parser;
 use tokio::{net::TcpListener, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
+mod handover;
 mod systemd;
 mod telemetry;
 
@@ -83,6 +91,22 @@ struct Arguments {
     /// Emit structured JSON tracing. RUST_LOG controls filtering in either mode.
     #[arg(long)]
     log_json: bool,
+
+    /// Enable cooperative SIGUSR2 process replacement for this systemd service.
+    #[arg(long, env = "BUS_PROXY_HANDOVER_UNIT")]
+    handover_unit: Option<String>,
+
+    /// Query the user manager rather than the system manager for handover.
+    #[arg(long, env = "BUS_PROXY_HANDOVER_USER")]
+    handover_user: bool,
+
+    /// Executable installed for the successor; defaults to the current binary path.
+    #[arg(long, env = "BUS_PROXY_HANDOVER_SUCCESSOR")]
+    handover_successor: Option<PathBuf>,
+
+    /// Compatibility probe only; does not load credentials, adopt FDs or start I/O.
+    #[arg(long, hide = true)]
+    check_handover_format: Option<u32>,
 }
 
 fn positive(value: &str) -> std::result::Result<usize, String> {
@@ -96,22 +120,34 @@ fn positive(value: &str) -> std::result::Result<usize, String> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Arguments::parse();
+    if let Some(version) = args.check_handover_format {
+        if version != bus_proxy_gateway::handover::FORMAT_VERSION {
+            return Err("unsupported handover format".into());
+        }
+        println!("OBP handover format {version}");
+        return Ok(());
+    }
     let activation = systemd::requested(
         std::env::var("LISTEN_PID").ok().as_deref(),
         std::env::var("LISTEN_FDS").ok().as_deref(),
         std::process::id(),
     )?;
-    if activation {
+    let descriptors = if activation > 0 {
+        let descriptors =
+            systemd::activated_fds(activation, std::env::var("LISTEN_FDNAMES").ok().as_deref())?;
         remove_activation_environment();
-    }
+        descriptors
+    } else {
+        HashMap::new()
+    };
     let telemetry = telemetry::init(args.log_json)?;
-    let result = run(args, activation).await;
+    let result = run(args, descriptors).await;
     // The batch worker uses blocking HTTP; flush outside Tokio's worker threads.
     tokio::task::spawn_blocking(move || telemetry.shutdown()).await?;
     result
 }
 
-async fn run(args: Arguments, activation: bool) -> Result<()> {
+async fn run(args: Arguments, mut descriptors: HashMap<String, OwnedFd>) -> Result<()> {
     if args.password_file.is_some() && args.credential.is_some() {
         return Err("choose one password source: --password-file or --credential".into());
     }
@@ -142,15 +178,69 @@ async fn run(args: Arguments, activation: bool) -> Result<()> {
         header_read_timeout: Duration::from_secs(args.header_read_seconds as u64),
     };
     let notify_socket = std::env::var_os("NOTIFY_SOCKET");
-    let listener = if activation {
-        if let Some(address) = args.listen {
-            return Err(format!(
-                "--listen {address} conflicts with systemd socket activation; \
-                 the socket unit's ListenStream= owns the bind address"
-            )
-            .into());
+    let manager = args.handover_unit.map(|unit| handover::Manager {
+        unit,
+        user: args.handover_user,
+    });
+    let transient: Vec<_> = descriptors
+        .keys()
+        .filter(|n| n.starts_with("bp-"))
+        .cloned()
+        .collect();
+    let manifests: Vec<_> = transient
+        .iter()
+        .filter(|n| n.ends_with("-manifest"))
+        .cloned()
+        .collect();
+    let image = if !transient.is_empty() {
+        let manager = manager
+            .as_ref()
+            .ok_or("inherited handover requires --handover-unit; refusing any resumed I/O")?;
+        // Invalidate every transferred store entry BEFORE restored owners can
+        // advance. A subsequent crash must get only the retained listener.
+        manager
+            .invalidate(notify_socket.as_deref(), &transient)
+            .await?;
+        if manifests.len() == 1 {
+            match handover::read_image(descriptors.remove(&manifests[0]).unwrap()) {
+                Ok(image) if manifests[0] == format!("bp-{}-manifest", image.generation) => {
+                    Some(image)
+                }
+                _ => {
+                    tracing::warn!(
+                        "invalid handover manifest; explicitly dropping inherited SSE/source transports"
+                    );
+                    None
+                }
+            }
+        } else {
+            tracing::warn!(
+                "incomplete handover: expected exactly one manifest; dropping inherited transports"
+            );
+            None
         }
-        let (listener, address) = systemd::adopt(systemd::activated_fd()?)?;
+    } else {
+        None
+    };
+    let listener_fd = descriptors.remove("listener").or_else(|| {
+        if descriptors.len() == 1 && transient.is_empty() {
+            let name = descriptors.keys().next().cloned().unwrap();
+            descriptors.remove(&name)
+        } else {
+            None
+        }
+    });
+    let listener = if let Some(fd) = listener_fd {
+        let (listener, address) = systemd::adopt(fd)?;
+        if args.listen.is_some_and(|expected| expected != address) {
+            return Err("configured --listen does not match the inherited listener address".into());
+        }
+        if image
+            .as_ref()
+            .is_some_and(|image| image.listener_address != address)
+        {
+            return Err("handover listener address mismatch".into());
+        }
         tracing::info!(%address, "listener adopted from systemd socket activation");
         TcpListener::from_std(listener)?
     } else {
@@ -172,12 +262,34 @@ async fn run(args: Arguments, activation: bool) -> Result<()> {
     };
     let address = listener.local_addr()?;
     let shutdown = CancellationToken::new();
-    let (router, mut routing) = Router::spawn(limits, shutdown.clone())?;
-    let mut gateway = tokio::spawn(bus_proxy_gateway::serve(
+    let (router, mut routing, imported) = if let Some(image) = image {
+        match image.import(&config, limits.clone(), descriptors, shutdown.clone()) {
+            Ok((router, task, imported)) => {
+                tracing::info!("handover imported; resuming established SSE clients and source");
+                (router, task, Some(imported))
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "handover validation failed; inherited connections closed, starting a fresh source epoch"
+                );
+                let (router, task) = Router::spawn(limits, shutdown.clone())?;
+                (router, task, None)
+            }
+        }
+    } else {
+        drop(descriptors); // Orphaned descriptors must not survive as hidden owners.
+        let (router, task) = Router::spawn(limits, shutdown.clone())?;
+        (router, task, None)
+    };
+    let reset_router = router.clone();
+    let (control, receiver) = bus_proxy_gateway::handover::channel();
+    let mut gateway = tokio::spawn(bus_proxy_gateway::serve_with_handover(
         listener,
         config,
         router,
         shutdown.clone(),
+        receiver,
+        imported,
     ));
     tracing::info!(%address, "event gateway listening");
     let _ = systemd::notify(
@@ -216,10 +328,22 @@ async fn run(args: Arguments, activation: bool) -> Result<()> {
         ),
         Router(std::result::Result<(), tokio::task::JoinError>),
     }
-    let stopped = tokio::select! {
-        result = stop_signal() => Stopped::Signal(result),
-        result = &mut gateway => Stopped::Gateway(result),
-        result = &mut routing => Stopped::Router(result),
+    let mut reset = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined2())?;
+    let successor = args.handover_successor.unwrap_or(std::env::current_exe()?);
+    let stopped = loop {
+        tokio::select! {
+            result = stop_signal() => break Stopped::Signal(result),
+            result = &mut gateway => break Stopped::Gateway(result),
+            result = &mut routing => break Stopped::Router(result),
+            _ = reset.recv() => {
+                if let Some(manager) = &manager {
+                    let needed = reset_router.snapshot().await?.subscriptions.len().saturating_add(2);
+                    if let Err(error) = manager.reset(&control, notify_socket.as_deref(), &successor, needed).await {
+                        tracing::warn!(%error, "cooperative reset not committed");
+                    }
+                } else { tracing::warn!("SIGUSR2 ignored: cooperative reset requires --handover-unit"); }
+            }
+        }
     };
     let _ = systemd::notify(notify_socket.as_deref(), "STOPPING=1");
     shutdown.cancel();

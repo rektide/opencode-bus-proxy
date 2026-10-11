@@ -969,8 +969,14 @@ name = "opencode-bus-proxy"
 version = "0.1.0"
 dependencies = [
  "bus-proxy-gateway",
+ "bus-proxy-protocol",
  "bus-proxy-router",
+ "bytes",
  "clap",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "libc",
  "opentelemetry",
  "opentelemetry-otlp",

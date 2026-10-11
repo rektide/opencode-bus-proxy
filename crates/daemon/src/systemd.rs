@@ -2,6 +2,7 @@
 //! sd_notify readiness/watchdog/fdstore messages.
 
 use std::{
+    collections::HashMap,
     ffi::OsStr,
     io,
     net::{SocketAddr, TcpListener},
@@ -11,30 +12,28 @@ use std::{
 };
 
 /// sd_listen_fds(3): decide whether the service manager handed this process
-/// listening descriptors. An absent or foreign PID means no handover; a
-/// descriptor count other than one is a unit configuration error.
+/// descriptors. An absent or foreign PID means no handover. Counts are bounded
+/// before ownership is taken; individual names, not numbers, identify material.
 pub(crate) fn requested(
     pid_value: Option<&str>,
     fds_value: Option<&str>,
     pid: u32,
-) -> Result<bool, String> {
+) -> Result<u32, String> {
     let Some(fds) = fds_value else {
-        return Ok(false);
+        return Ok(0);
     };
     if fds.trim() == "0" {
-        return Ok(false);
+        return Ok(0);
     }
     match pid_value.map(str::trim).map(str::parse::<u32>) {
         Some(Ok(listen_pid)) if listen_pid == pid => {}
-        Some(Ok(_)) => return Ok(false),
+        Some(Ok(_)) => return Ok(0),
         Some(Err(_)) => return Err("invalid LISTEN_PID from service manager".into()),
         None => return Err("LISTEN_FDS set without LISTEN_PID".into()),
     }
     match fds.trim().parse::<u32>() {
-        Ok(1) => Ok(true),
-        Ok(count) => Err(format!(
-            "systemd socket activation passed {count} listeners; this gateway takes exactly one ListenStream socket"
-        )),
+        Ok(count @ 1..=4096) => Ok(count),
+        Ok(_) => Err("LISTEN_FDS exceeds the supported descriptor limit".into()),
         Err(_) => Err("invalid LISTEN_FDS from service manager".into()),
     }
 }
@@ -43,6 +42,23 @@ pub(crate) fn requested(
 /// non-socket or unbound handovers (for example a ListenFIFO= unit) with an
 /// actionable error.
 pub(crate) fn adopt(fd: OwnedFd) -> io::Result<(TcpListener, SocketAddr)> {
+    let mut listening: libc::c_int = 0;
+    let mut length = std::mem::size_of_val(&listening) as libc::socklen_t;
+    if unsafe {
+        libc::getsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_ACCEPTCONN,
+            (&mut listening as *mut libc::c_int).cast(),
+            &mut length,
+        )
+    } < 0
+        || listening != 1
+    {
+        return Err(io::Error::other(
+            "activated descriptor is not a listening TCP socket; configure ListenStream=",
+        ));
+    }
     let listener = TcpListener::from(fd);
     listener.set_nonblocking(true)?;
     let address = listener.local_addr().map_err(|_| {
@@ -54,18 +70,54 @@ pub(crate) fn adopt(fd: OwnedFd) -> io::Result<(TcpListener, SocketAddr)> {
 }
 
 /// sd_listen_fds(3) reserves descriptor 3 for the first activated socket.
-pub(crate) fn activated_fd() -> Result<OwnedFd, io::Error> {
-    // Probing before ownership keeps a closed handover a clean configuration
-    // error instead of an IO-safety abort when the descriptor is dropped.
-    if unsafe { libc::fcntl(3, libc::F_GETFD) } < 0 {
+pub(crate) fn activated_fds(
+    count: u32,
+    names: Option<&str>,
+) -> io::Result<HashMap<String, OwnedFd>> {
+    let names = descriptor_names(count, names)?;
+    let mut output = HashMap::new();
+    for (index, name) in names.into_iter().enumerate() {
+        let raw = 3 + index as libc::c_int;
+        if unsafe { libc::fcntl(raw, libc::F_GETFD) } < 0 {
+            return Err(io::Error::other("activated descriptor is closed"));
+        }
+        // Take each inherited descriptor once, and prevent children from reusing it.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        if unsafe { libc::fcntl(raw, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        output.insert(name, fd);
+    }
+    Ok(output)
+}
+
+fn descriptor_names(count: u32, names: Option<&str>) -> io::Result<Vec<String>> {
+    let names: Vec<String> = match names {
+        Some(names) => names.split(':').map(str::to_owned).collect(),
+        None if count == 1 => vec!["listener".into()],
+        None => {
+            return Err(io::Error::other(
+                "multi-FD activation requires LISTEN_FDNAMES",
+            ));
+        }
+    };
+    if names.len() != count as usize
+        || names.iter().any(|n| !valid_name(n))
+        || names.iter().collect::<std::collections::HashSet<_>>().len() != names.len()
+    {
         return Err(io::Error::other(
-            "LISTEN_FDS requested activation but descriptor 3 is closed; \
-             the service manager must pass the ListenStream= socket",
+            "invalid, duplicate or incomplete LISTEN_FDNAMES",
         ));
     }
-    // SAFETY: the service manager duplicated the listening socket into this
-    // process at descriptor 3; ownership transfers here and nowhere else.
-    Ok(unsafe { OwnedFd::from_raw_fd(3) })
+    Ok(names)
+}
+
+fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 255
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
 
 /// sd_notify(3): best-effort datagram to the service manager. An absent or
@@ -80,11 +132,64 @@ pub(crate) fn notify(socket: Option<&OsStr>, message: &str) -> io::Result<()> {
 /// FileDescriptorStoreMax= to be non-zero. An absent or empty NOTIFY_SOCKET
 /// means no manager and reports success, the same contract as notify().
 pub(crate) fn fdstore(socket: Option<&OsStr>, name: &str, fd: BorrowedFd<'_>) -> io::Result<()> {
+    if !valid_name(name) {
+        return Err(io::Error::other("invalid fdstore name"));
+    }
     send_to_manager(
         socket,
         format!("FDSTORE=1\nFDNAME={name}").as_bytes(),
         Some(fd),
     )
+}
+
+pub(crate) fn store_transient(
+    socket: Option<&OsStr>,
+    name: &str,
+    fd: BorrowedFd<'_>,
+) -> io::Result<()> {
+    if socket.is_none_or(|s| s.is_empty()) || !valid_name(name) {
+        return Err(io::Error::other(
+            "handover requires a manager and valid descriptor names",
+        ));
+    }
+    send_to_manager(
+        socket,
+        format!("FDSTORE=1\nFDPOLL=0\nFDNAME={name}").as_bytes(),
+        Some(fd),
+    )
+}
+
+pub(crate) fn remove(socket: Option<&OsStr>, name: &str) -> io::Result<()> {
+    if !valid_name(name) {
+        return Err(io::Error::other("invalid fdstore name"));
+    }
+    notify(socket, &format!("FDSTOREREMOVE=1\nFDNAME={name}"))
+}
+
+/// Confirm processing, NOT acceptance. Callers must separately inspect the store.
+pub(crate) fn barrier(socket: Option<&OsStr>) -> io::Result<()> {
+    if socket.is_none_or(|s| s.is_empty()) {
+        return Err(io::Error::other("handover requires NOTIFY_SOCKET"));
+    }
+    let mut raw = [0; 2];
+    if unsafe { libc::pipe2(raw.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let read = unsafe { OwnedFd::from_raw_fd(raw[0]) };
+    let write = unsafe { OwnedFd::from_raw_fd(raw[1]) };
+    use std::os::fd::AsFd;
+    send_to_manager(socket, b"BARRIER=1", Some(write.as_fd()))?;
+    drop(write);
+    let mut poll = libc::pollfd {
+        fd: read.as_raw_fd(),
+        events: libc::POLLHUP,
+        revents: 0,
+    };
+    let result = unsafe { libc::poll(&mut poll, 1, 3000) };
+    if result <= 0 || poll.revents & libc::POLLHUP == 0 {
+        return Err(io::Error::other("notify barrier timed out"));
+    }
+    Ok(())
 }
 
 /// Control-message buffer bytes for one SCM_RIGHTS descriptor: a cmsghdr
@@ -114,14 +219,14 @@ fn send_to_manager(
         iov_base: payload.as_ptr() as *mut libc::c_void,
         iov_len: payload.len(),
     }];
-    let mut control = [0u8; control_space()];
+    let mut control = [0usize; control_space().div_ceil(std::mem::size_of::<usize>())];
     let mut message = libc::msghdr {
         msg_name: &address as *const _ as *mut libc::c_void,
         msg_namelen: length,
         msg_iov: vectors.as_mut_ptr(),
         msg_iovlen: 1,
         msg_control: control.as_mut_ptr().cast::<libc::c_void>(),
-        msg_controllen: control.len(),
+        msg_controllen: control_space(),
         msg_flags: 0,
     };
     if let Some(fd) = fd {
@@ -198,15 +303,16 @@ mod tests {
     #[test]
     fn activation_requires_local_pid_and_single_listener() {
         let pid = 42u32.to_string();
-        assert!(!requested(None, None, 42).unwrap());
-        assert!(!requested(None, Some("0"), 42).unwrap());
-        assert!(!requested(Some(&pid), Some("0"), 42).unwrap());
-        assert!(requested(Some(&pid), Some("1"), 42).unwrap());
+        assert_eq!(requested(None, None, 42).unwrap(), 0);
+        assert_eq!(requested(None, Some("0"), 42).unwrap(), 0);
+        assert_eq!(requested(Some(&pid), Some("0"), 42).unwrap(), 0);
+        assert_eq!(requested(Some(&pid), Some("1"), 42).unwrap(), 1);
         assert!(
-            !requested(Some("7"), Some("1"), 42).unwrap(),
+            requested(Some("7"), Some("1"), 42).unwrap() == 0,
             "a foreign pid is not this process's activation"
         );
-        assert!(requested(Some(&pid), Some("2"), 42).is_err());
+        assert_eq!(requested(Some(&pid), Some("2"), 42).unwrap(), 2);
+        assert!(requested(Some(&pid), Some("4097"), 42).is_err());
         assert!(requested(Some(&pid), Some("x"), 42).is_err());
         assert!(requested(None, Some("1"), 42).is_err());
         assert!(requested(Some("x"), Some("1"), 42).is_err());
