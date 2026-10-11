@@ -8,10 +8,10 @@ pub struct Telemetry(Option<SdkTracerProvider>);
 
 impl Telemetry {
     pub fn shutdown(self) {
-        if let Some(provider) = self.0 {
-            if let Err(error) = provider.shutdown() {
-                eprintln!("OTLP shutdown failed: {error}");
-            }
+        if let Some(provider) = self.0
+            && let Err(error) = provider.shutdown()
+        {
+            eprintln!("OTLP shutdown failed: {error}");
         }
     }
 }
@@ -50,13 +50,18 @@ pub fn init(json: bool) -> Result<Telemetry> {
         ) {
             return Err("OTLP protocol must be http/protobuf or http/json".into());
         }
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let exporter = opentelemetry_otlp::SpanExporter::builder()
             .with_http()
             .build()?;
         // Resource detectors honor OTEL_SERVICE_NAME and OTEL_RESOURCE_ATTRIBUTES.
         let detected = Resource::builder().build();
-        let service_name = detected.get(&opentelemetry::Key::new("service.name"))
-            .map(|value| value.to_string())
+        let service_name = setting("OTEL_SERVICE_NAME")
+            .or_else(|| {
+                detected
+                    .get(&opentelemetry::Key::new("service.name"))
+                    .map(|value| value.to_string())
+            })
             .filter(|name| !name.starts_with("unknown_service"))
             .unwrap_or_else(|| "opencode-bus-proxy".into());
         let resource = Resource::builder()

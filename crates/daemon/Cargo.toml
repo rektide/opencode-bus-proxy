@@ -18,6 +18,7 @@ opentelemetry_sdk = { version = "0.33.1", default-features = false, features = [
 opentelemetry-otlp = { version = "0.33.1", default-features = false, features = ["trace", "http-proto", "http-json", "reqwest-blocking-client"] }
 # Reuse the gateway's ring provider rather than enabling a second rustls provider.
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 tracing-opentelemetry = { version = "0.34", default-features = false }
 
 [dev-dependencies]
