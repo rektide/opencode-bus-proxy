@@ -768,15 +768,25 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 name = "opencode-bus-proxy"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "bus-proxy-gateway",
  "bus-proxy-router",
+ "bytes",
  "clap",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "libc",
+ "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "url",
+ "uuid",
 ]
 
 [[package]]

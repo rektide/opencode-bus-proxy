@@ -7,6 +7,7 @@ use tokio::{net::TcpListener, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
+mod registration;
 mod systemd;
 
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
@@ -38,6 +39,14 @@ struct Arguments {
     /// Shared origin password systemd credential name, read from $CREDENTIALS_DIRECTORY.
     #[arg(long, env = "BUS_PROXY_CREDENTIAL")]
     credential: Option<String>,
+
+    /// Contribute the gateway URL to this existing operator-owned OpenCode record.
+    #[arg(long, env = "BUS_PROXY_SERVICE_FILE")]
+    service_file: Option<PathBuf>,
+
+    /// Advertised local URL; defaults to the actual listener with wildcard mapped to loopback.
+    #[arg(long, env = "BUS_PROXY_SERVICE_URL", requires = "service_file")]
+    service_url: Option<String>,
 
     /// Explicitly allow an origin and gateway without authentication.
     #[arg(long)]
@@ -170,6 +179,20 @@ async fn main() -> Result<()> {
         listener
     };
     let address = listener.local_addr()?;
+    let registration = args
+        .service_file
+        .map(|file| {
+            registration::Registration::new(
+                file,
+                &config.upstream,
+                args.service_url.as_deref(),
+                address,
+                &config.username,
+                config.password.clone(),
+                config.request_timeout,
+            )
+        })
+        .transpose()?;
     let shutdown = CancellationToken::new();
     let (router, mut routing) = Router::spawn(limits, shutdown.clone())?;
     let mut gateway = tokio::spawn(bus_proxy_gateway::serve(
@@ -179,6 +202,8 @@ async fn main() -> Result<()> {
         shutdown.clone(),
     ));
     tracing::info!(%address, "event gateway listening");
+    let mut registration =
+        registration.map(|registration| tokio::spawn(registration.run(shutdown.clone())));
     let _ = systemd::notify(
         notify_socket.as_deref(),
         &format!("READY=1\nSTATUS=event gateway on {address}"),
@@ -214,15 +239,27 @@ async fn main() -> Result<()> {
             >,
         ),
         Router(std::result::Result<(), tokio::task::JoinError>),
+        Registration(std::result::Result<(), tokio::task::JoinError>),
     }
     let stopped = tokio::select! {
         result = stop_signal() => Stopped::Signal(result),
         result = &mut gateway => Stopped::Gateway(result),
         result = &mut routing => Stopped::Router(result),
+        result = async {
+            match &mut registration {
+                Some(task) => task.await,
+                None => std::future::pending().await,
+            }
+        } => Stopped::Registration(result),
     };
     let _ = systemd::notify(notify_socket.as_deref(), "STOPPING=1");
     shutdown.cancel();
     tracing::info!("event gateway stopping");
+    if !matches!(stopped, Stopped::Registration(_)) {
+        if let Some(task) = &mut registration {
+            join_shutdown(task).await?;
+        }
+    }
     match stopped {
         Stopped::Signal(result) => {
             result?;
@@ -239,6 +276,14 @@ async fn main() -> Result<()> {
             join_shutdown(&mut gateway).await??;
             result?;
             return Err("routing actor exited unexpectedly".into());
+        }
+        Stopped::Registration(result) => {
+            let (gateway, router) =
+                tokio::join!(join_shutdown(&mut gateway), join_shutdown(&mut routing));
+            gateway??;
+            router?;
+            result?;
+            return Err("discovery contribution task exited unexpectedly".into());
         }
     }
     Ok(())
