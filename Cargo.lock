@@ -771,6 +771,7 @@ dependencies = [
  "bus-proxy-gateway",
  "bus-proxy-router",
  "clap",
+ "libc",
  "tempfile",
  "tokio",
  "tokio-util",

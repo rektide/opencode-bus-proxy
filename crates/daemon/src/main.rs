@@ -134,6 +134,7 @@ async fn main() -> Result<()> {
         max_connections: args.max_connections,
         header_read_timeout: Duration::from_secs(args.header_read_seconds as u64),
     };
+    let notify_socket = std::env::var_os("NOTIFY_SOCKET");
     let activation = systemd::requested(
         std::env::var("LISTEN_PID").ok().as_deref(),
         std::env::var("LISTEN_FDS").ok().as_deref(),
@@ -147,7 +148,7 @@ async fn main() -> Result<()> {
             )
             .into());
         }
-        let (listener, address) = systemd::adopt(systemd::activated_fd())?;
+        let (listener, address) = systemd::adopt(systemd::activated_fd()?)?;
         tracing::info!(%address, "listener adopted from systemd socket activation");
         remove_activation_environment();
         TcpListener::from_std(listener)?
@@ -167,6 +168,31 @@ async fn main() -> Result<()> {
         shutdown.clone(),
     ));
     tracing::info!(%address, "event gateway listening");
+    let _ = systemd::notify(
+        notify_socket.as_deref(),
+        &format!("READY=1\nSTATUS=event gateway on {address}"),
+    );
+    if let Some(interval) =
+        systemd::watchdog_interval(std::env::var("WATCHDOG_USEC").ok().as_deref())
+    {
+        let socket = notify_socket.clone();
+        let stopped = shutdown.clone();
+        tokio::spawn(async move {
+            let mut heartbeat = tokio::time::interval(interval);
+            heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = stopped.cancelled() => break,
+                    _ = heartbeat.tick() => {
+                        if systemd::notify(socket.as_deref(), "WATCHDOG=1").is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     enum Stopped {
         Signal(std::io::Result<()>),
@@ -183,6 +209,7 @@ async fn main() -> Result<()> {
         result = &mut gateway => Stopped::Gateway(result),
         result = &mut routing => Stopped::Router(result),
     };
+    let _ = systemd::notify(notify_socket.as_deref(), "STOPPING=1");
     shutdown.cancel();
     tracing::info!("event gateway stopping");
     match stopped {
