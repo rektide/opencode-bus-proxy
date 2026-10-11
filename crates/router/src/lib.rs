@@ -43,8 +43,7 @@ impl Limits {
         // Tokio channels use a semaphore internally. Keep byte/count values
         // representable by u32 as well, so alternate queue implementations cannot
         // silently truncate their budgets. No preallocation uses these capacities.
-        if self.queue_frames == 0
-            || self.queue_bytes == 0
+        if self.queue_bytes == 0
             || self.max_subscribers == 0
             || self.command_capacity == 0
             || self.queue_frames > u32::MAX as usize
@@ -121,6 +120,8 @@ pub struct Gauges {
     pub memberships: usize,
     pub backlog_frames: usize,
     pub backlog_bytes: usize,
+    pub direct_frames: usize,
+    pub direct_bytes: usize,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -131,6 +132,9 @@ pub struct SubscriptionInfo {
     pub sessions: Vec<String>,
     pub backlog_frames: usize,
     pub backlog_bytes: usize,
+    pub queue_frame_target: usize,
+    pub direct_frames: usize,
+    pub direct_bytes: usize,
 }
 
 /// Index/epoch snapshot at one actor turn. Socket readers can concurrently reduce
@@ -139,6 +143,7 @@ pub struct SubscriptionInfo {
 #[derive(Clone, Debug, Serialize)]
 pub struct Snapshot {
     pub epoch: Option<String>,
+    pub queue_frame_target: usize,
     pub subscriptions: Vec<SubscriptionInfo>,
     pub counters: Counters,
     pub gauges: Gauges,
@@ -150,6 +155,7 @@ pub struct Snapshot {
 #[serde(deny_unknown_fields)]
 pub struct RouterImage {
     pub limits: Limits,
+    pub queue_frame_target: usize,
     pub epoch: String,
     pub subscriptions: Vec<SubscriptionImage>,
     pub counters: Counters,
@@ -163,6 +169,7 @@ pub struct SubscriptionImage {
     pub active: bool,
     pub sessions: Vec<String>,
     pub frames: Vec<FrameImage>,
+    pub direct: Option<FrameImage>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -178,6 +185,9 @@ struct Backlog {
     frames: VecDeque<Bytes>,
     bytes: usize,
     closed: bool,
+    target_frames: usize,
+    waiting: bool,
+    direct: Option<Bytes>,
 }
 
 struct Queue {
@@ -185,7 +195,6 @@ struct Queue {
     notify: Notify,
     canceled: CancellationToken,
     epoch_canceled: CancellationToken,
-    max_frames: usize,
     max_bytes: usize,
 }
 
@@ -196,11 +205,13 @@ impl Queue {
                 frames: VecDeque::new(),
                 bytes: 0,
                 closed: false,
+                target_frames: limits.queue_frames,
+                waiting: false,
+                direct: None,
             }),
             notify: Notify::new(),
             canceled: epoch_canceled.child_token(),
             epoch_canceled,
-            max_frames: limits.queue_frames,
             max_bytes: limits.queue_bytes,
         }
     }
@@ -215,11 +226,25 @@ impl Queue {
             backlog.closed = true;
             backlog.frames.clear();
             backlog.bytes = 0;
+            backlog.direct = None;
+            backlog.waiting = false;
         }
         self.canceled.cancel();
     }
 
     fn offer(&self, frame: Bytes) -> Result<(), RouterError> {
+        self.admit(frame, false)
+    }
+
+    fn opening(&self, frame: Bytes) -> Result<(), RouterError> {
+        self.admit(frame, true)
+    }
+
+    fn set_target(&self, frames: usize) {
+        lock(&self.backlog).target_frames = frames;
+    }
+
+    fn admit(&self, frame: Bytes, opening: bool) -> Result<(), RouterError> {
         if self.is_closed() {
             return Err(RouterError::NotFound);
         }
@@ -227,17 +252,38 @@ impl Queue {
         if backlog.closed || self.is_closed() {
             return Err(RouterError::NotFound);
         }
-        if backlog.frames.len() >= self.max_frames || frame.len() > self.max_bytes - backlog.bytes {
+        let direct_bytes = backlog.direct.as_ref().map_or(0, Bytes::len);
+        if frame.len() > self.max_bytes - backlog.bytes - direct_bytes {
             return Err(RouterError::Overloaded);
         }
-        backlog.bytes += frame.len();
-        backlog.frames.push_back(frame);
+        if backlog.target_frames == 0 {
+            if !backlog.frames.is_empty()
+                || backlog.direct.is_some()
+                || (!backlog.waiting && !opening)
+            {
+                return Err(RouterError::Overloaded);
+            }
+            backlog.direct = Some(frame);
+            backlog.waiting = false; // Consume exactly one granted delivery credit.
+        } else {
+            if backlog.frames.len() >= backlog.target_frames {
+                return Err(RouterError::Overloaded);
+            }
+            backlog.bytes += frame.len();
+            backlog.frames.push_back(frame);
+        }
         drop(backlog);
         self.notify.notify_one();
         Ok(())
     }
 
     async fn recv(&self) -> Option<Bytes> {
+        struct Credit<'a>(&'a Queue);
+        impl Drop for Credit<'_> {
+            fn drop(&mut self) {
+                lock(&self.0.backlog).waiting = false;
+            }
+        }
         loop {
             // One receiver (&mut Subscription) plus notify_one's saved permit
             // avoids a lost wake between an empty check and awaiting notification.
@@ -247,13 +293,19 @@ impl Queue {
                 if backlog.closed || self.is_closed() {
                     backlog.frames.clear();
                     backlog.bytes = 0;
+                    backlog.direct = None;
                     return None;
+                }
+                if let Some(frame) = backlog.direct.take() {
+                    return Some(frame);
                 }
                 if let Some(frame) = backlog.frames.pop_front() {
                     backlog.bytes -= frame.len();
                     return Some(frame);
                 }
+                backlog.waiting = true;
             }
+            let _credit = Credit(self);
             tokio::select! {
                 biased;
                 _ = self.canceled.cancelled() => return None,
@@ -264,6 +316,19 @@ impl Queue {
                 _ = notified => {}
             }
         }
+    }
+
+    fn try_recv(&self) -> Option<Bytes> {
+        let mut backlog = lock(&self.backlog);
+        if backlog.closed || self.is_closed() {
+            return None;
+        }
+        if let Some(frame) = backlog.direct.take() {
+            return Some(frame);
+        }
+        let frame = backlog.frames.pop_front()?;
+        backlog.bytes -= frame.len();
+        Some(frame)
     }
 
     fn sample(&self) -> (usize, usize) {
@@ -293,6 +358,11 @@ impl Subscription {
         self.queue.recv().await
     }
 
+    /// Drain only already admitted material; does not arm a new receive credit.
+    pub fn try_recv(&mut self) -> Option<Bytes> {
+        self.queue.try_recv()
+    }
+
     /// Relinquish the old guard without closing its queue. Only the handover
     /// coordinator may use this, after exporting and irrevocably giving up I/O.
     pub fn relinquish(mut self) {
@@ -320,6 +390,7 @@ enum Command {
     End(String, Reply<()>),
     Subscribe(Mode, Reply<Subscription>),
     Replace(String, Interest, Reply<()>),
+    QueueFrames(usize, Reply<()>),
     Publish(String, Route, Bytes, Reply<()>),
     Snapshot(Reply<Snapshot>),
     Freeze(usize, Reply<RouterImage>),
@@ -354,6 +425,7 @@ impl Router {
             shutdown: shutdown.clone(),
         };
         let actor = Actor {
+            queue_frame_target: limits.queue_frames,
             limits,
             commands: commands.downgrade(),
             epoch_signal,
@@ -420,6 +492,16 @@ impl Router {
             .await
     }
 
+    /// Atomic actor-owned target update across existing and future subscriptions.
+    /// Existing admitted material is retained, even when occupancy exceeds target.
+    pub async fn set_queue_frames(&self, frames: usize) -> Result<(), RouterError> {
+        if frames > u32::MAX as usize {
+            return Err(RouterError::InvalidLimits);
+        }
+        self.request(|reply| Command::QueueFrames(frames, reply))
+            .await
+    }
+
     pub async fn publish(
         &self,
         epoch: String,
@@ -457,6 +539,7 @@ impl Router {
     ) -> Result<(Self, tokio::task::JoinHandle<()>, Vec<Subscription>), RouterError> {
         limits.validate()?;
         if image.limits != limits
+            || image.queue_frame_target > u32::MAX as usize
             || image.epoch.is_empty()
             || image.subscriptions.len() > limits.max_subscribers
         {
@@ -471,6 +554,7 @@ impl Router {
             shutdown: shutdown.clone(),
         };
         let mut actor = Actor {
+            queue_frame_target: image.queue_frame_target,
             limits,
             commands: commands.downgrade(),
             epoch_signal,
@@ -499,10 +583,23 @@ impl Router {
                 return Err(RouterError::InvalidImage);
             }
             let queue = Arc::new(Queue::new(&actor.limits, token.clone()));
-            for frame in sub.frames {
-                queue
-                    .offer(Bytes::from(frame.0))
-                    .map_err(|_| RouterError::InvalidImage)?;
+            {
+                let mut backlog = lock(&queue.backlog);
+                backlog.target_frames = actor.queue_frame_target;
+                // A lowered target is not a license to discard older admissions.
+                for frame in sub.frames {
+                    if frame.0.is_empty() || frame.0.len() > queue.max_bytes - backlog.bytes {
+                        return Err(RouterError::InvalidImage);
+                    }
+                    backlog.bytes += frame.0.len();
+                    backlog.frames.push_back(Bytes::from(frame.0));
+                }
+                if let Some(frame) = sub.direct {
+                    if frame.0.is_empty() || frame.0.len() > queue.max_bytes - backlog.bytes {
+                        return Err(RouterError::InvalidImage);
+                    }
+                    backlog.direct = Some(Bytes::from(frame.0));
+                }
             }
             let span = tracing::info_span!("event.subscription", subscription_id = %sub.id, mode = ?sub.mode);
             if sub.active {
@@ -554,6 +651,7 @@ struct Subscriber {
 
 struct Actor {
     limits: Limits,
+    queue_frame_target: usize,
     commands: mpsc::WeakSender<Command>,
     epoch_signal: EpochSignal,
     epoch: Option<(String, CancellationToken)>,
@@ -666,6 +764,7 @@ impl Actor {
                 }
                 Command::Begin(_, reply)
                 | Command::End(_, reply)
+                | Command::QueueFrames(_, reply)
                 | Command::Replace(_, _, reply)
                 | Command::Publish(_, _, _, reply) => {
                     let _ = reply.send(Err(RouterError::Frozen));
@@ -691,6 +790,13 @@ impl Actor {
                 }
             }
             Command::Thaw(reply) => {
+                let _ = reply.send(Ok(()));
+            }
+            Command::QueueFrames(frames, reply) => {
+                self.queue_frame_target = frames;
+                for sub in self.subscribers.values() {
+                    sub.queue.set_target(frames);
+                }
                 let _ = reply.send(Ok(()));
             }
             Command::Begin(epoch, reply) => {
@@ -752,7 +858,8 @@ impl Actor {
         let id = format!("evsub_{}", uuid::Uuid::new_v4().simple());
         let span = tracing::info_span!("event.subscription", subscription_id = %id, ?mode);
         let queue = Arc::new(Queue::new(&self.limits, epoch_token.clone()));
-        queue.offer(match mode {
+        queue.set_target(self.queue_frame_target);
+        queue.opening(match mode {
             Mode::Legacy => connected_frame(),
             Mode::Controlled => ready_frame(&id),
         })?;
@@ -792,7 +899,7 @@ impl Actor {
             return Err(RouterError::NotFound);
         }
         if !subscriber.active {
-            if let Err(error) = subscriber.queue.offer(connected_frame()) {
+            if let Err(error) = subscriber.queue.opening(connected_frame()) {
                 if error == RouterError::Overloaded {
                     self.counters.queue_overflows = self.counters.queue_overflows.saturating_add(1);
                 }
@@ -887,6 +994,11 @@ impl Actor {
         let mut gauges = Gauges::default();
         for (id, subscriber) in &self.subscribers {
             let (backlog_frames, backlog_bytes) = subscriber.queue.sample();
+            let direct_bytes = lock(&subscriber.queue.backlog)
+                .direct
+                .as_ref()
+                .map_or(0, Bytes::len);
+            let direct_frames = usize::from(direct_bytes > 0);
             let mut sessions: Vec<_> = subscriber.sessions.iter().cloned().collect();
             sessions.sort_unstable();
             subscriptions.push(SubscriptionInfo {
@@ -896,6 +1008,9 @@ impl Actor {
                 sessions,
                 backlog_frames,
                 backlog_bytes,
+                queue_frame_target: self.queue_frame_target,
+                direct_frames,
+                direct_bytes,
             });
             gauges.subscriptions += 1;
             if subscriber.active {
@@ -910,10 +1025,13 @@ impl Actor {
             gauges.memberships = gauges.memberships.saturating_add(subscriber.sessions.len());
             gauges.backlog_frames = gauges.backlog_frames.saturating_add(backlog_frames);
             gauges.backlog_bytes = gauges.backlog_bytes.saturating_add(backlog_bytes);
+            gauges.direct_frames = gauges.direct_frames.saturating_add(direct_frames);
+            gauges.direct_bytes = gauges.direct_bytes.saturating_add(direct_bytes);
         }
         subscriptions.sort_unstable_by(|a, b| a.id.cmp(&b.id));
         Snapshot {
             epoch: self.epoch.as_ref().map(|(epoch, _)| epoch.clone()),
+            queue_frame_target: self.queue_frame_target,
             subscriptions,
             counters: self.counters.clone(),
             gauges,
@@ -948,6 +1066,11 @@ impl Actor {
                     .saturating_add(4)
                     .saturating_add(frame.len().div_ceil(3).saturating_mul(4));
             }
+            if let Some(frame) = &backlog.direct {
+                weight = weight
+                    .saturating_add(4)
+                    .saturating_add(frame.len().div_ceil(3).saturating_mul(4));
+            }
             if weight > json_budget {
                 return Err(RouterError::ImageLimit);
             }
@@ -970,11 +1093,16 @@ impl Actor {
                     .iter()
                     .map(|b| FrameImage(b.to_vec()))
                     .collect(),
+                direct: backlog
+                    .direct
+                    .as_ref()
+                    .map(|frame| FrameImage(frame.to_vec())),
             });
         }
         subscriptions.sort_unstable_by(|a, b| a.id.cmp(&b.id));
         Ok(RouterImage {
             limits: self.limits.clone(),
+            queue_frame_target: self.queue_frame_target,
             epoch: epoch.to_owned(),
             subscriptions,
             counters: self.counters.clone(),
@@ -985,6 +1113,155 @@ impl Actor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{future::Future, task::Poll};
+
+    async fn arm<F: Future>(future: &mut std::pin::Pin<Box<F>>) {
+        std::future::poll_fn(|cx| {
+            assert!(future.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn zero_queue_credit_is_cancel_safe_bounded_and_openings_still_work() {
+        let stop = CancellationToken::new();
+        let (router, task) = Router::spawn(
+            Limits {
+                queue_frames: 0,
+                ..Limits::default()
+            },
+            stop.clone(),
+        )
+        .unwrap();
+        router.begin_epoch("one".into()).await.unwrap();
+        let mut legacy = router.subscribe(Mode::Legacy).await.unwrap();
+        let mut controlled = router.subscribe(Mode::Controlled).await.unwrap();
+        assert!(legacy.recv().await.is_some());
+        assert!(controlled.recv().await.is_some());
+        router
+            .replace(controlled.id().into(), Interest { sessions: vec![] })
+            .await
+            .unwrap();
+        assert!(controlled.recv().await.is_some());
+        let mut receiving = Box::pin(legacy.recv());
+        arm(&mut receiving).await;
+        router
+            .publish(
+                "one".into(),
+                Route::Broadcast,
+                Bytes::from_static(b"direct"),
+            )
+            .await
+            .unwrap();
+        // Another controlled zero-queue subscriber with no credit fails locally.
+        assert!(controlled.recv().await.is_none());
+        let snapshot = router.snapshot().await.unwrap();
+        assert_eq!(snapshot.gauges.backlog_frames, 0);
+        assert_eq!(snapshot.gauges.direct_frames, 1);
+        drop(receiving); // The granted frame must not disappear with its receive future.
+        assert_eq!(legacy.recv().await.unwrap(), b"direct"[..]);
+        let mut canceled_credit = Box::pin(legacy.recv());
+        arm(&mut canceled_credit).await;
+        drop(canceled_credit);
+        router
+            .publish(
+                "one".into(),
+                Route::Broadcast,
+                Bytes::from_static(b"no-credit"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            legacy.recv().await.is_none(),
+            "canceling an empty receive revokes credit"
+        );
+        assert_eq!(router.snapshot().await.unwrap().counters.queue_overflows, 2);
+        stop.cancel();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_shrink_drains_prior_admissions_and_policy_and_credit_survive_import() {
+        let limits = Limits {
+            queue_frames: 3,
+            ..Limits::default()
+        };
+        let stop = CancellationToken::new();
+        let (router, task) = Router::spawn(limits.clone(), stop.clone()).unwrap();
+        router.begin_epoch("one".into()).await.unwrap();
+        let mut sub = router.subscribe(Mode::Legacy).await.unwrap();
+        sub.recv().await.unwrap();
+        for bytes in ["first", "second", "third"] {
+            router
+                .publish("one".into(), Route::Broadcast, Bytes::from(bytes))
+                .await
+                .unwrap();
+        }
+        router.set_queue_frames(0).await.unwrap();
+        let snapshot = router.snapshot().await.unwrap();
+        assert_eq!(snapshot.queue_frame_target, 0);
+        assert_eq!(
+            snapshot.gauges.backlog_frames, 3,
+            "shrink never discards queued bytes"
+        );
+        let image = router.freeze().await.unwrap();
+        assert_eq!(router.set_queue_frames(2).await, Err(RouterError::Frozen));
+        let id = sub.id().to_owned();
+        sub.relinquish();
+        stop.cancel();
+        task.await.unwrap();
+        let stop = CancellationToken::new();
+        let (router, task, mut guards) =
+            Router::import(image, limits.clone(), stop.clone()).unwrap();
+        let mut sub = guards.pop().unwrap();
+        assert_eq!(sub.id(), id);
+        for expected in ["first", "second", "third"] {
+            assert_eq!(sub.recv().await.unwrap(), expected);
+        }
+        let mut receiving = Box::pin(sub.recv());
+        arm(&mut receiving).await;
+        router
+            .publish(
+                "one".into(),
+                Route::Broadcast,
+                Bytes::from_static(b"credit-at-cut"),
+            )
+            .await
+            .unwrap();
+        drop(receiving);
+        let image = router.freeze().await.unwrap();
+        assert!(image.subscriptions[0].direct.is_some());
+        sub.relinquish();
+        stop.cancel();
+        task.await.unwrap();
+        let stop = CancellationToken::new();
+        let (router, task, mut guards) = Router::import(image, limits, stop.clone()).unwrap();
+        let mut sub = guards.pop().unwrap();
+        assert_eq!(sub.recv().await.unwrap(), b"credit-at-cut"[..]);
+        router.set_queue_frames(2).await.unwrap();
+        router
+            .publish(
+                "one".into(),
+                Route::Broadcast,
+                Bytes::from_static(b"grown-one"),
+            )
+            .await
+            .unwrap();
+        router
+            .publish(
+                "one".into(),
+                Route::Broadcast,
+                Bytes::from_static(b"grown-two"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(sub.recv().await.unwrap(), b"grown-one"[..]);
+        assert_eq!(sub.recv().await.unwrap(), b"grown-two"[..]);
+        assert_eq!(router.snapshot().await.unwrap().queue_frame_target, 2);
+        stop.cancel();
+        task.await.unwrap();
+    }
 
     #[tokio::test]
     async fn handover_preserves_ids_pending_interests_order_and_limits() {

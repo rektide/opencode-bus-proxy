@@ -144,6 +144,71 @@ async fn connection_limits_must_be_positive() {
     }
 }
 type Body = UnsyncBoxBody<Bytes, Error>;
+
+#[tokio::test]
+async fn queue_policy_control_is_authenticated_bounded_cors_compatible_and_inspectable() {
+    let harness = Harness::new().await;
+    let mut unauthorized = harness.request("PUT", "/_bus/queue", full("{\"frames\":0}"));
+    unauthorized.headers_mut().remove("authorization");
+    assert_eq!(
+        harness.client.request(unauthorized).await.unwrap().status(),
+        401
+    );
+    for invalid in [
+        "{\"frames\":-1}",
+        "{\"frames\":1.5}",
+        "{\"frames\":\"0\"}",
+        "{\"frames\":4294967296}",
+        "{\"frames\":0,\"extra\":true}",
+        "{}",
+        &" ".repeat(1025),
+    ] {
+        assert_eq!(
+            harness
+                .client
+                .request(harness.request("PUT", "/_bus/queue", full(invalid.to_owned())))
+                .await
+                .unwrap()
+                .status(),
+            400
+        );
+    }
+    for frames in [0, 12] {
+        let mut request = harness.request(
+            "PUT",
+            "/_bus/queue",
+            full(format!("{{\"frames\":{frames}}}")),
+        );
+        request
+            .headers_mut()
+            .insert("origin", "http://localhost:1".parse().unwrap());
+        let response = harness.client.request(request).await.unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response.headers()["access-control-allow-origin"],
+            "http://localhost:1"
+        );
+        let response = harness
+            .client
+            .request(harness.request("GET", "/_bus/queue", full(Bytes::new())))
+            .await
+            .unwrap();
+        let value: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(value["frames"], frames);
+        let response = harness
+            .client
+            .request(harness.request("GET", "/_bus/subscriptions", full(Bytes::new())))
+            .await
+            .unwrap();
+        let value: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(value["queue_frame_target"], frames);
+    }
+    harness.close().await;
+}
 fn full(value: impl Into<Bytes>) -> Body {
     Full::new(value.into())
         .map_err(|never| match never {})

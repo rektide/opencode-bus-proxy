@@ -55,7 +55,8 @@ struct Arguments {
     #[arg(long)]
     cors: Vec<String>,
 
-    #[arg(long, default_value_t = Limits::default().queue_frames, value_parser = positive)]
+    /// Waiting-frame target per subscriber; zero uses one ready-receiver credit.
+    #[arg(long, default_value_t = Limits::default().queue_frames, value_parser = frame_target)]
     queue_frames: usize,
 
     /// Logical queued bytes per subscriber, excluding HTTP/socket buffers.
@@ -115,6 +116,13 @@ fn positive(value: &str) -> std::result::Result<usize, String> {
         .ok()
         .filter(|value| *value > 0)
         .ok_or_else(|| "expected a positive integer".to_owned())
+}
+
+fn frame_target(value: &str) -> std::result::Result<usize, String> {
+    value
+        .parse::<u32>()
+        .map(|v| v as usize)
+        .map_err(|_| "expected an integer from 0 to 4294967295".into())
 }
 
 #[tokio::main]

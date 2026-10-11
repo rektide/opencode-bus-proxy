@@ -449,7 +449,7 @@ async fn snapshot_is_serializable_and_reports_admissions_not_receipts() {
 async fn invalid_limits_and_unready_subscribe_do_not_panic() {
     for limits in [
         Limits {
-            queue_frames: 0,
+            queue_frames: usize::MAX,
             ..Limits::default()
         },
         Limits {

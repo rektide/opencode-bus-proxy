@@ -40,6 +40,37 @@ type HttpClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, Body>;
 const CONTROL_PREFIX: &str = "/api/experimental/event/subscriptions/";
 const INTEREST_BYTES: usize = 262144;
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QueuePolicy {
+    frames: u32,
+}
+
+async fn queue_policy(request: &mut Request<Incoming>, state: &State) -> Response<Body> {
+    let read = async {
+        let mut bytes = Vec::new();
+        while let Some(frame) = request.body_mut().frame().await {
+            if let Ok(data) = frame.map_err(|_| ())?.into_data() {
+                if data.len() > 1024 - bytes.len() {
+                    return Err(());
+                }
+                bytes.extend_from_slice(&data);
+            }
+        }
+        serde_json::from_slice::<QueuePolicy>(&bytes).map_err(|_| ())
+    };
+    match tokio::time::timeout(state.config.request_timeout, read).await {
+        Ok(Ok(policy)) => match state.router.set_queue_frames(policy.frames as usize).await {
+            Ok(()) => json(StatusCode::OK, serde_json::json!({"frames":policy.frames})),
+            Err(error) => router_error(error, ""),
+        },
+        _ => failure(
+            StatusCode::BAD_REQUEST,
+            "Expected a bounded JSON object with frames: an integer from 0 to 4294967295",
+        ),
+    }
+}
+
 #[derive(Clone)]
 pub struct Config {
     pub upstream: String,
@@ -563,6 +594,8 @@ async fn handle(mut request: Request<Incoming>, state: Arc<State>) -> Response<B
                 serde_json::json!({"_tag":"InvalidRequestError","message":"Invalid event interest request body","field":"interest"}),
             ),
         }
+    } else if request.method() == Method::PUT && path == "/_bus/queue" {
+        queue_policy(&mut request, &state).await
     } else if request.method() == Method::GET && path.starts_with("/_bus/") {
         if path == "/_bus/handover" {
             json(StatusCode::OK, state.registry.inspect(&state))
@@ -580,6 +613,10 @@ async fn handle(mut request: Request<Incoming>, state: Arc<State>) -> Response<B
                             serde_json::json!({"ready":value["epoch"].is_string()}),
                         ),
                         "/_bus/subscriptions" => json(StatusCode::OK, value),
+                        "/_bus/queue" => json(
+                            StatusCode::OK,
+                            serde_json::json!({"frames":value["queue_frame_target"], "gauges":value["gauges"]}),
+                        ),
                         "/_bus/metrics" => {
                             let mut text = format!(
                                 "bus_proxy_ready {}\nbus_proxy_source_frames_total {}\nbus_proxy_source_bytes_total {}\nbus_proxy_source_failures_total {}\n",
