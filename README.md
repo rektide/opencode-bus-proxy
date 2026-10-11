@@ -61,6 +61,10 @@ argv or the environment — a hardened production unit preset ships in
 
 ## Inspect
 
+Optional OTLP trace export: set `OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318`.
+Collector headers, resource attributes, sampling, batching, and independent export
+filtering are described in [OTLP configuration](doc/event-multiplexer/operations.md#otlp-trace-export).
+
 Authenticated endpoints:
 
 | Path                  | What it answers                                                                                           |

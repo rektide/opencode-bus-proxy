@@ -186,6 +186,53 @@ state. In-flight HTTP requests and upgraded tunnels also need an explicit
 handover strategy. Origin restarts still require client refresh because the event
 source is live-only; preserving a downstream socket cannot recover missed events.
 
+## OTLP trace export
+
+The daemon can batch-export its existing `tracing` spans and their events over
+OTLP/HTTP. Export is opt-in: set a collector endpoint or `OTEL_TRACES_EXPORTER=otlp`.
+For example, in the service's environment:
+
+```ini
+Environment=OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318
+Environment=OTEL_SERVICE_NAME=opencode-bus-proxy
+Environment=OTEL_RESOURCE_ATTRIBUTES=deployment.environment.name=local
+Environment=BUS_PROXY_OTEL_FILTER=info,bus_proxy_gateway=debug,bus_proxy_router=debug
+```
+
+| Environment | Meaning / default |
+| --- | --- |
+| `OTEL_TRACES_EXPORTER` | `otlp` enables export (default collector `http://localhost:4318`); `none` disables it even with endpoints set. Unset enables only when an endpoint is present. Other values are rejected. |
+| `OTEL_SDK_DISABLED` | `true` (case-insensitive) disables export regardless of the other settings. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | Collector base URL; the SDK appends `/v1/traces`. HTTP and HTTPS are supported. |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | Full traces URL, used verbatim; overrides the generic endpoint. |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` / `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` | `http/protobuf` (default) or `http/json`; trace-specific wins. gRPC is rejected. |
+| `OTEL_EXPORTER_OTLP_HEADERS` / `OTEL_EXPORTER_OTLP_TRACES_HEADERS` | Comma-separated `key=value` headers, e.g. `authorization=Bearer%20token`. Trace-specific replaces generic headers. |
+| `OTEL_EXPORTER_OTLP_TIMEOUT` / `OTEL_EXPORTER_OTLP_TRACES_TIMEOUT` | Export HTTP timeout in milliseconds (SDK default 10000); trace-specific wins. |
+| `OTEL_SERVICE_NAME` | Service name, default `opencode-bus-proxy`; takes precedence over `service.name` in resource attributes. |
+| `OTEL_RESOURCE_ATTRIBUTES` | Comma-separated resource `key=value` attributes. `service.version` is supplied from the daemon package version. |
+| `OTEL_TRACES_SAMPLER` / `OTEL_TRACES_SAMPLER_ARG` | SDK sampling, default `parentbased_always_on`. Supported samplers: `always_on`, `always_off`, `traceidratio`, `parentbased_always_on`, `parentbased_always_off`, `parentbased_traceidratio`. Ratio argument is 0–1. |
+| `OTEL_BSP_SCHEDULE_DELAY` | Batch interval in milliseconds (5000). |
+| `OTEL_BSP_MAX_QUEUE_SIZE` | Bounded completed-span queue (2048). |
+| `OTEL_BSP_MAX_EXPORT_BATCH_SIZE` | Maximum spans per batch (512), capped by queue size. |
+| `BUS_PROXY_OTEL_FILTER` | Export filter using `RUST_LOG` directive syntax (default `info`), independent of local logging. Only proxy-owned tracing targets are exported, preventing exporter feedback loops. |
+
+`RUST_LOG` and `--log-json` still control local output. Sampling and export
+filtering do not suppress local logs. Standalone log events outside spans are
+not OTLP logs; metrics remain available at `/_bus/metrics`. There is no incoming
+HTTP trace-context extraction or outgoing context injection in this integration.
+
+Spans export when closed: long-lived subscriptions and the router can remain
+open until disconnect/shutdown. There are no per-frame spans. Export runs on a
+bounded background worker; collector failures do not interrupt gateway traffic.
+Shutdown drains completed spans after gateway/router shutdown, with the SDK's
+bounded shutdown wait (5 seconds). Export is best-effort; queue overflow,
+collector failure, or a forced kill can lose telemetry.
+
+HTTPS uses platform certificate verification. Custom OTLP certificate/mTLS env
+settings and compression are not configured by this integration. SDK numeric
+and sampling settings follow SDK fallback behavior on invalid values; malformed
+export filters and unsupported exporter/protocol selections fail startup.
+
 ## Limits and failure behavior
 
 Use `--help` for current defaults. The configurable limits are:
