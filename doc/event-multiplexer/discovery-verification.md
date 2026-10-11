@@ -102,8 +102,12 @@ rename does not share the proxy lock: final-check/rename has a documented
 residual non-cooperating writer race, not transactional fencing.
 
 No live service, client, binary, registration, or OpenCode build was changed.
-The user-requested post-completion work anchor is filed in the native proxy
-tracker; deployment remains explicitly outside this completed source scope.
+The user-requested post-completion work anchor is **ocbp-native-discovery** in
+this repository's native proxy tracker (`bd show ocbp-native-discovery`). It is
+closed for the verified source scope, with implementation checkpoints, current
+homes, all three session IDs and deferred activation decisions. Its selective
+export checkpoint is `bbacf23c`; unrelated ticket edits were preserved.
+Deployment remains explicitly outside this completed source scope.
 
 ## Connected homes
 
