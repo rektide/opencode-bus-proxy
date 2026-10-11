@@ -31,6 +31,10 @@ struct Arguments {
     #[arg(long, env = "BUS_PROXY_PASSWORD_FILE")]
     password_file: Option<PathBuf>,
 
+    /// Shared origin password systemd credential name, read from $CREDENTIALS_DIRECTORY.
+    #[arg(long, env = "BUS_PROXY_CREDENTIAL")]
+    credential: Option<String>,
+
     /// Explicitly allow an origin and gateway without authentication.
     #[arg(long)]
     allow_unauthenticated: bool,
@@ -97,9 +101,17 @@ async fn main() -> Result<()> {
         subscriber.try_init()?;
     }
 
-    let password = read_password(args.password_file.as_ref()).await?;
+    if args.password_file.is_some() && args.credential.is_some() {
+        return Err("choose one password source: --password-file or --credential".into());
+    }
+    let password = read_password(
+        args.password_file.as_ref(),
+        args.credential.as_deref(),
+        std::env::var_os("CREDENTIALS_DIRECTORY"),
+    )
+    .await?;
     if password.is_none() && !args.allow_unauthenticated {
-        return Err("set OPENCODE_SERVER_PASSWORD or --password-file; use --allow-unauthenticated only for an unauthenticated origin".into());
+        return Err("set OPENCODE_SERVER_PASSWORD, --password-file, or --credential; use --allow-unauthenticated only for an unauthenticated origin".into());
     }
     let limits = Limits {
         queue_frames: args.queue_frames,
@@ -168,24 +180,62 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn read_password(file: Option<&PathBuf>) -> Result<Option<String>> {
-    let value = match file {
-        Some(file) => Some(tokio::fs::read_to_string(file).await?),
-        None => match std::env::var("OPENCODE_SERVER_PASSWORD") {
+async fn read_password(
+    file: Option<&PathBuf>,
+    credential: Option<&str>,
+    credential_directory: Option<std::ffi::OsString>,
+) -> Result<Option<String>> {
+    let value = if let Some(file) = file {
+        Some(tokio::fs::read_to_string(file).await?)
+    } else if let Some(name) = credential {
+        let path = credential_path(name, credential_directory.as_deref())?;
+        Some(tokio::fs::read_to_string(&path).await.map_err(
+            |error| -> Box<dyn Error + Send + Sync> {
+                format!("read credential {}: {error}", path.display()).into()
+            },
+        )?)
+    } else {
+        match std::env::var("OPENCODE_SERVER_PASSWORD") {
             Ok(value) => Some(value),
             Err(std::env::VarError::NotPresent) => None,
             Err(error) => return Err(error.into()),
-        },
+        }
     };
-    // Files conventionally end in a newline; other password whitespace is meaningful.
+    // Files and systemd credentials conventionally end in a newline; env values
+    // and other password whitespace are meaningful.
     let value = value.map(|value| {
-        if file.is_some() {
+        if file.is_some() || credential.is_some() {
             value.trim_end_matches(['\r', '\n']).to_owned()
         } else {
             value
         }
     });
     Ok(value.filter(|value| !value.is_empty()))
+}
+
+/// systemd credential names are filename-safe identifiers. The leading byte
+/// must be alphanumeric so a joined name cannot traverse out of the directory.
+fn valid_credential_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+}
+
+fn credential_path(name: &str, directory: Option<&std::ffi::OsStr>) -> Result<PathBuf> {
+    if !valid_credential_name(name) {
+        return Err(format!(
+            "credential name {name:?} must start with a letter or digit and contain only letters, digits, '.', '-', or '_'"
+        )
+        .into());
+    }
+    let directory = directory.filter(|value| !value.is_empty()).ok_or_else(|| {
+        Box::<dyn Error + Send + Sync>::from(
+            "--credential requires $CREDENTIALS_DIRECTORY, provided by a systemd unit with LoadCredential=, LoadCredentialEncrypted=, SetCredential=, or ImportCredential=",
+        )
+    })?;
+    Ok(PathBuf::from(directory).join(name))
 }
 
 async fn join_shutdown<T>(task: &mut JoinHandle<T>) -> Result<T> {
@@ -211,4 +261,107 @@ async fn stop_signal() -> std::io::Result<()> {
     }
     #[cfg(not(unix))]
     tokio::signal::ctrl_c().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn credential_names_must_be_filename_safe() {
+        for name in [
+            "opencode-password",
+            "busproxy.password",
+            "cred_1",
+            "a",
+            "A9._-",
+        ] {
+            assert!(valid_credential_name(name), "{name}");
+        }
+        for name in [
+            "",
+            ".",
+            "..",
+            "../escape",
+            "/absolute",
+            "a/b",
+            "a\\b",
+            "a b",
+            ".hidden",
+            "_reserved",
+            "café",
+        ] {
+            assert!(!valid_credential_name(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn credential_paths_require_directory_and_validated_name() {
+        let path = credential_path(
+            "opencode-password",
+            Some(std::ffi::OsStr::new("/run/creds")),
+        )
+        .expect("valid name and directory");
+        assert_eq!(path, PathBuf::from("/run/creds/opencode-password"));
+        assert!(credential_path("..", Some(std::ffi::OsStr::new("/run"))).is_err());
+        assert!(credential_path("ok", None).is_err());
+        assert!(credential_path("ok", Some(std::ffi::OsStr::new(""))).is_err());
+    }
+
+    #[tokio::test]
+    async fn credential_files_trim_trailing_newlines_like_password_files() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            directory.path().join("opencode-password"),
+            "shared-secret\r\n",
+        )
+        .expect("write credential");
+        let value = read_password(
+            None,
+            Some("opencode-password"),
+            Some(directory.path().as_os_str().to_owned()),
+        )
+        .await
+        .expect("read password");
+        assert_eq!(value.as_deref(), Some("shared-secret"));
+    }
+
+    #[tokio::test]
+    async fn empty_credential_yields_no_password() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        std::fs::write(directory.path().join("empty"), "\n").expect("write credential");
+        let value = read_password(
+            None,
+            Some("empty"),
+            Some(directory.path().as_os_str().to_owned()),
+        )
+        .await
+        .expect("read password");
+        assert_eq!(value, None);
+    }
+
+    #[tokio::test]
+    async fn missing_credential_directory_is_an_actionable_error() {
+        let error = read_password(None, Some("opencode-password"), None)
+            .await
+            .expect_err("directory required");
+        assert!(
+            error.to_string().contains("$CREDENTIALS_DIRECTORY"),
+            "{}",
+            error
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_credential_file_names_the_path() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let error = read_password(
+            None,
+            Some("absent"),
+            Some(directory.path().as_os_str().to_owned()),
+        )
+        .await
+        .expect_err("file required");
+        assert!(error.to_string().contains("absent"), "{error}");
+    }
 }
