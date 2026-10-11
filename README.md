@@ -52,12 +52,17 @@ environment override takes precedence (use `cargo +1.98.0` to select it explicit
 
 The daemon is systemd-aware: socket units hand over the listening socket via
 socket activation (the socket unit's `ListenStream=` owns the address; an
-explicit `--listen` conflicts and is rejected), and `Type=notify` units get
+explicit `--listen` must match the inherited address), and `Type=notify` units get
 `READY=1` once serving, `STOPPING=1` at shutdown, and `WatchdogSec=` heartbeats.
 Together with `--credential`, a unit file runs the gateway without secrets in
 argv or the environment — a hardened production unit preset ships in
 [`systemd/`](systemd/) (see
 [operations](doc/event-multiplexer/operations.md)).
+
+Opt-in [cooperative SSE handover](doc/event-multiplexer/handover.md) preserves
+supported established responses **and their plain-HTTP source** across SIGUSR2
+process replacement. Choose exact `buffered` transfer or bounded `boundary`
+drain/drop, and adjust waiting-frame targets live, including zero.
 
 ## Inspect
 
@@ -72,6 +77,8 @@ Authenticated endpoints:
 | `/_bus/health`        | Is the source ready? Returns 503 while disconnected.                                                      |
 | `/_bus/subscriptions` | Which live subscriptions are legacy/pending/active, which Sessions they follow, and their queue pressure. |
 | `/_bus/metrics`       | Prometheus counters and gauges for source traffic and routing admissions.                                 |
+| `/_bus/handover`      | Transfer capabilities, connection/subscription ownership, and last preparation progress.                  |
+| `/_bus/queue`        | GET selected waiting-frame target; authenticated PUT `{"frames":0}` (or another u32) changes it live.       |
 
 Source failure aborts downstream SSE responses with a transport error and
 invalidates subscription IDs; it does not report successful stream completion.

@@ -78,8 +78,8 @@ service manager provides them:
 - **Socket activation** — with `LISTEN_PID`/`LISTEN_FDS` set for this process,
   the gateway adopts the single `ListenStream=` descriptor systemd duplicated
   into it and does not bind. An explicit `--listen`/`BUS_PROXY_LISTEN`
-  alongside activation is a configuration error; the socket unit owns the
-  address. Without activation, `--listen` defaults to `127.0.0.1:4097`.
+  alongside activation must match its actual bound address. Without activation,
+  `--listen` defaults to `127.0.0.1:4097`.
 - **Readiness notification** — `Type=notify` units receive `READY=1` (with the
   listening address as `STATUS=`) once the gateway accepts connections and
   `STOPPING=1` when shutdown begins. Readiness means serving; upstream source
@@ -164,9 +164,9 @@ Composition rules:
   handover — from a socket unit or a replayed fdstore — is not re-stored:
   the manager already retains that socket, and duplicate store entries
   would accumulate across restarts.
-- A replayed store arrives as ordinary socket activation, so a unit relying
-  on fdstore must not pass `--listen`/`BUS_PROXY_LISTEN`: the daemon
-  rejects the combination on the restart where the handover first appears.
+- A replayed store arrives as named socket activation. An explicit
+  `--listen`/`BUS_PROXY_LISTEN` validates the inherited address, so nondefault
+  self-bound ports survive restarts without removing their configuration.
 - With the socket unit enabled, the manager holds the listening socket
   itself and the daemon never takes the self-bound branch;
   `FileDescriptorStoreMax=1` is then simply unused.
@@ -175,16 +175,14 @@ The handoff is best-effort: without a service manager it is a no-op, and a
 failed store only means restarts rebind with a brief refused window — logged
 at debug, never fatal.
 
-The store currently preserves only the listener, not accepted client connections.
-The proposed [active-client handover registry](../../design/event-multiplexer/active-client-handover.md)
-inventories the descriptors, subscription state, buffers and transfer boundaries.
-Active-client handover for uninterrupted proxy upgrades is a future direction:
-it needs a quiesced handover boundary, versioned subscription/queue state, and
-ownership transfer of each socket together with HTTP framing and buffered bytes.
-Duplicating a socket into fdstore alone does not preserve Hyper's connection
-state. In-flight HTTP requests and upgraded tunnels also need an explicit
-handover strategy. Origin restarts still require client refresh because the event
-source is live-only; preserving a downstream socket cannot recover missed events.
+Normal restarts preserve only the listener. Opt-in
+[cooperative SSE handover](handover.md) uses SIGUSR2, named client/source sockets,
+and a sealed private memfd image to preserve established supported SSE responses
+and their plain-HTTP source. It offers exact buffered transfer and bounded
+boundary drain/drop, with explicit unsupported-connection failure. Its unit
+capacity, bootstrap, signal, ownership, and stale-image rules are different from
+ordinary restart. An origin restart still requires client refresh: live-only
+missed events cannot be recovered by retaining a downstream socket.
 
 ## OTLP trace export
 
@@ -237,7 +235,10 @@ export filters and unsupported exporter/protocol selections fail startup.
 
 Use `--help` for current defaults. The configurable limits are:
 
-- `--queue-frames` and `--queue-bytes`: per-subscriber backlog. Logical bytes are
+- `--queue-frames` and `--queue-bytes`: per-subscriber backlog. The frame target
+  is also adjustable through authenticated `PUT /_bus/queue`, including zero's
+  one ready-receiver credit; shrink preserves old admissions while they drain.
+  See [queue semantics](handover.md#live-queue-dial-including-zero). Logical bytes are
   charged independently for every recipient, although physical frame storage is
   shared. These bounds exclude bytes already yielded to HTTP/kernel buffers.
 - `--max-subscribers`: includes inactive subscriptions waiting for their first PUT.

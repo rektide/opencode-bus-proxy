@@ -21,9 +21,13 @@ image once per planned upgrade, after every participating owner has paused at th
 same logical cut. Subscription metadata is mostly slow-changing. Data-plane
 buffers change on every read, publication, dequeue, and write.
 
-This is a proposed inventory and transfer contract, not an implemented exporter.
-Current fdstore support preserves only the listener. See
-[operations](../../doc/event-multiplexer/operations.md#descriptor-store-restart-continuity-without-a-socket-unit).
+**Implementation update, 2026-10-11:** the first supported subset is now
+implemented and isolated process replacement is verified. Maintained instructions,
+capabilities, buffered/boundary modes, live queue targets, and evidence live in
+[cooperative SSE handover](../../doc/event-multiplexer/handover.md). The inventory
+and blockers below preserve the original proposal's broader requirements; their
+“current owner / gap” wording describes the pre-implementation inspection, not
+today's full status. Normal unplanned restarts still preserve only the listener.
 
 ## Registry of material
 

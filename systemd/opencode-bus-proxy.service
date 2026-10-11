@@ -8,7 +8,7 @@
 # service manager, so restarts keep the listening socket and newly accepted
 # connections without a connection-refused window. In both cases the
 # listener reaches the daemon through the same LISTEN_FDS handover, so
-# ExecStart must never pass --listen (the daemon rejects the combination).
+# an explicit --listen may validate the inherited address (must match).
 #
 # Install into /etc/systemd/system/ with the socket unit, place the shared
 # origin password at /etc/opencode/server-password (mode 0600, root-owned),
