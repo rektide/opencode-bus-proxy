@@ -1,12 +1,12 @@
-//! systemd service-manager integration: socket-activation adoption.
+//! systemd service-manager integration: socket-activation adoption and
+//! sd_notify readiness/watchdog/fdstore messages.
 
 use std::{
     ffi::OsStr,
     io,
     net::{SocketAddr, TcpListener},
-    os::fd::{FromRawFd, OwnedFd},
-    os::unix::{ffi::OsStrExt, net::UnixDatagram},
-    path::Path,
+    os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
+    os::unix::ffi::OsStrExt,
     time::Duration,
 };
 
@@ -71,48 +71,81 @@ pub(crate) fn activated_fd() -> Result<OwnedFd, io::Error> {
 /// sd_notify(3): best-effort datagram to the service manager. An absent or
 /// empty NOTIFY_SOCKET means no manager and reports success.
 pub(crate) fn notify(socket: Option<&OsStr>, message: &str) -> io::Result<()> {
+    send_to_manager(socket, message.as_bytes(), None)
+}
+
+/// sd_notify(3) fdstore: hand a descriptor to the service manager so it is
+/// held across a restart and replayed to the next service instance through
+/// the ordinary LISTEN_FDS activation handover. Requires the unit's
+/// FileDescriptorStoreMax= to be non-zero. An absent or empty NOTIFY_SOCKET
+/// means no manager and reports success, the same contract as notify().
+pub(crate) fn fdstore(socket: Option<&OsStr>, name: &str, fd: BorrowedFd<'_>) -> io::Result<()> {
+    send_to_manager(
+        socket,
+        format!("FDSTORE=1\nFDNAME={name}").as_bytes(),
+        Some(fd),
+    )
+}
+
+/// Control-message buffer bytes for one SCM_RIGHTS descriptor: a cmsghdr
+/// plus one file descriptor, padded like the CMSG_SPACE() macro.
+const fn control_space() -> usize {
+    // SAFETY: CMSG_SPACE is pure size arithmetic on its argument.
+    unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as libc::c_uint) as usize }
+}
+
+/// Send one datagram to the manager's notify socket, attaching the
+/// descriptor through an SCM_RIGHTS control message when given.
+fn send_to_manager(
+    socket: Option<&OsStr>,
+    payload: &[u8],
+    fd: Option<BorrowedFd<'_>>,
+) -> io::Result<()> {
     let Some(socket) = socket.filter(|value| !value.is_empty()) else {
         return Ok(());
     };
-    let raw = socket.as_bytes();
-    if raw.first() == Some(&b'@') {
-        send_abstract(&raw[1..], message)
-    } else {
-        UnixDatagram::unbound()?.send_to(message.as_bytes(), Path::new(socket))?;
-        Ok(())
-    }
-}
-
-/// A leading '@' names an abstract-namespace socket: the byte becomes the
-/// address's leading NUL, which never touches the filesystem.
-fn send_abstract(name: &[u8], message: &str) -> io::Result<()> {
-    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
-    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
-    if name.is_empty() || name.len() >= address.sun_path.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "invalid abstract notify socket name",
-        ));
-    }
-    for (slot, byte) in address.sun_path[1..].iter_mut().zip(name) {
-        *slot = *byte as libc::c_char;
-    }
-    let length = std::mem::size_of::<libc::sa_family_t>() + 1 + name.len();
+    let (address, length) = manager_address(socket.as_bytes())?;
     let descriptor =
         unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
     if descriptor < 0 {
         return Err(io::Error::last_os_error());
     }
-    let sent = unsafe {
-        libc::sendto(
-            descriptor,
-            message.as_ptr().cast(),
-            message.len(),
-            0,
-            &address as *const _ as *const libc::sockaddr,
-            length as libc::socklen_t,
-        )
+    let mut vectors = [libc::iovec {
+        iov_base: payload.as_ptr() as *mut libc::c_void,
+        iov_len: payload.len(),
+    }];
+    let mut control = [0u8; control_space()];
+    let mut message = libc::msghdr {
+        msg_name: &address as *const _ as *mut libc::c_void,
+        msg_namelen: length,
+        msg_iov: vectors.as_mut_ptr(),
+        msg_iovlen: 1,
+        msg_control: control.as_mut_ptr().cast::<libc::c_void>(),
+        msg_controllen: control.len(),
+        msg_flags: 0,
     };
+    if let Some(fd) = fd {
+        // SAFETY: CMSG_FIRSTHDR on the freshly built msghdr above returns a
+        // pointer into `control`, whose CONTROL_SPACE bytes fit exactly one
+        // cmsghdr with a one-descriptor SCM_RIGHTS payload.
+        let header = unsafe { libc::CMSG_FIRSTHDR(&message) };
+        let raw = fd.as_raw_fd();
+        unsafe {
+            (*header).cmsg_level = libc::SOL_SOCKET;
+            (*header).cmsg_type = libc::SCM_RIGHTS;
+            (*header).cmsg_len =
+                libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as libc::c_uint) as usize;
+            std::ptr::copy_nonoverlapping(
+                &raw as *const libc::c_int as *const u8,
+                libc::CMSG_DATA(header),
+                std::mem::size_of::<libc::c_int>(),
+            );
+        }
+    } else {
+        message.msg_control = std::ptr::null_mut();
+        message.msg_controllen = 0;
+    }
+    let sent = unsafe { libc::sendmsg(descriptor, &message, 0) };
     let result = if sent < 0 {
         Err(io::Error::last_os_error())
     } else {
@@ -120,6 +153,33 @@ fn send_abstract(name: &[u8], message: &str) -> io::Result<()> {
     };
     unsafe { libc::close(descriptor) };
     result
+}
+
+/// Build the datagram address for a notify socket. A leading '@' names an
+/// abstract-namespace socket: the byte becomes the address's leading NUL,
+/// which never touches the filesystem. Any other value is a filesystem path.
+fn manager_address(socket: &[u8]) -> io::Result<(libc::sockaddr_un, libc::socklen_t)> {
+    let invalid = || io::Error::new(io::ErrorKind::InvalidInput, "invalid notify socket name");
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    let (name, offset) = if socket.first() == Some(&b'@') {
+        (&socket[1..], 1)
+    } else if socket.is_empty() {
+        return Err(invalid());
+    } else if socket.contains(&0) {
+        // A filesystem path must be NUL-terminated inside sun_path.
+        return Err(invalid());
+    } else {
+        (socket, 0)
+    };
+    if name.is_empty() || offset + name.len() >= address.sun_path.len() {
+        return Err(invalid());
+    }
+    for (slot, byte) in address.sun_path[offset..].iter_mut().zip(name) {
+        *slot = *byte as libc::c_char;
+    }
+    let length = std::mem::size_of::<libc::sa_family_t>() + offset + name.len();
+    Ok((address, length as libc::socklen_t))
 }
 
 /// sd_notify(3) watchdog contract: heartbeat at most half the configured
@@ -133,6 +193,7 @@ pub(crate) fn watchdog_interval(value: Option<&str>) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{os::fd::AsFd, os::unix::net::UnixDatagram};
 
     #[test]
     fn activation_requires_local_pid_and_single_listener() {
@@ -217,6 +278,103 @@ mod tests {
         };
         unsafe { libc::close(descriptor) };
         assert_eq!(&buffer[..result.expect("receive")], b"WATCHDOG=1");
+    }
+
+    #[test]
+    fn fdstore_without_a_manager_is_success() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        assert!(fdstore(None, "listener", listener.as_fd()).is_ok());
+        assert!(fdstore(Some(OsStr::new("")), "listener", listener.as_fd()).is_ok());
+    }
+
+    #[test]
+    fn fdstore_hands_the_listener_to_filesystem_managers() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("notify");
+        let receiver = UnixDatagram::bind(&path).expect("bind receiver");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        fdstore(Some(path.as_os_str()), "listener", listener.as_fd()).expect("fdstore");
+        let (payload, received) = receive_with_fd(receiver.as_raw_fd()).expect("receive");
+        assert_eq!(payload.as_slice(), b"FDSTORE=1\nFDNAME=listener");
+        let received = received.expect("one descriptor in SCM_RIGHTS");
+        assert_eq!(
+            TcpListener::from(received).local_addr().unwrap(),
+            listener.local_addr().unwrap(),
+            "the stored descriptor names the same listening socket",
+        );
+    }
+
+    #[test]
+    fn fdstore_hands_the_listener_to_abstract_managers() {
+        let name = format!("bus-proxy-fdstore-test-{}", std::process::id());
+        let descriptor = bind_abstract(name.as_bytes()).expect("bind abstract receiver");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let address = std::ffi::OsString::from(format!("@{name}"));
+        fdstore(Some(address.as_os_str()), "listener", listener.as_fd()).expect("fdstore");
+        let (payload, received) = receive_with_fd(descriptor).expect("receive");
+        unsafe { libc::close(descriptor) };
+        assert_eq!(payload.as_slice(), b"FDSTORE=1\nFDNAME=listener");
+        let received = received.expect("one descriptor in SCM_RIGHTS");
+        assert_eq!(
+            TcpListener::from(received).local_addr().unwrap(),
+            listener.local_addr().unwrap(),
+            "the stored descriptor names the same listening socket",
+        );
+    }
+
+    /// Receive one datagram plus any SCM_RIGHTS-attached descriptor from a
+    /// unix datagram socket, checking the control message's level and type.
+    fn receive_with_fd(socket: libc::c_int) -> io::Result<(Vec<u8>, Option<OwnedFd>)> {
+        let mut buffer = [0u8; 128];
+        let mut control = [0u8; control_space()];
+        let mut vector = libc::iovec {
+            iov_base: buffer.as_mut_ptr().cast::<libc::c_void>(),
+            iov_len: buffer.len(),
+        };
+        let mut message = libc::msghdr {
+            msg_name: std::ptr::null_mut(),
+            msg_namelen: 0,
+            msg_iov: &mut vector,
+            msg_iovlen: 1,
+            msg_control: control.as_mut_ptr().cast::<libc::c_void>(),
+            msg_controllen: control.len(),
+            msg_flags: 0,
+        };
+        // SAFETY: MSG_CMSG_CLOEXEC makes any received descriptor
+        // close-on-exec, so owning it below cannot leak into children.
+        let read = unsafe { libc::recvmsg(socket, &mut message, libc::MSG_CMSG_CLOEXEC) };
+        if read < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut received: Option<OwnedFd> = None;
+        // SAFETY: CMSG_FIRSTHDR/CMSG_NXTHDR walk the control buffer the
+        // kernel just validated into `message`; accepted headers lie inside
+        // it, and a descriptor payload is exactly one c_int wide.
+        let mut header = unsafe { libc::CMSG_FIRSTHDR(&message) };
+        while !header.is_null() {
+            unsafe {
+                if (*header).cmsg_level == libc::SOL_SOCKET
+                    && (*header).cmsg_type == libc::SCM_RIGHTS
+                {
+                    let payload = (*header).cmsg_len - libc::CMSG_LEN(0) as usize;
+                    assert_eq!(payload, std::mem::size_of::<libc::c_int>());
+                    let mut raw: libc::c_int = 0;
+                    std::ptr::copy_nonoverlapping(
+                        libc::CMSG_DATA(header).cast::<libc::c_int>(),
+                        &mut raw,
+                        1,
+                    );
+                    // SAFETY: the kernel duplicated the sender's descriptor
+                    // into this process for us to own.
+                    assert!(
+                        received.replace(OwnedFd::from_raw_fd(raw)).is_none(),
+                        "one SCM_RIGHTS message"
+                    );
+                }
+            }
+            header = unsafe { libc::CMSG_NXTHDR(&message, header) };
+        }
+        Ok((buffer[..read as usize].to_vec(), received))
     }
 
     fn bind_abstract(name: &[u8]) -> io::Result<libc::c_int> {

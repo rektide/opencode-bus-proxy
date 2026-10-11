@@ -89,6 +89,9 @@ service manager provides them:
   configured timeout. The watchdog reflects process liveness, not source
   health; the source supervisor's reconnect backoff can legitimately outlast a
   tight watchdog budget, so size `WatchdogSec=` for that.
+- **Descriptor store** — a self-bound listener is offered to the manager via
+  `FDSTORE=1`, so restarts keep the listening socket even without a socket
+  unit; see the subsection below for the composition rules.
 
 ```ini
 # opencode-bus-proxy.socket
@@ -139,6 +142,38 @@ through `LoadCredential=` and never sees it in argv or the environment.
 
 The preset also sets `FileDescriptorStoreMax=1`, which pairs with the
 gateway's fdstore handoff — see the next section.
+
+### Descriptor store: restart continuity without a socket unit
+
+systemd's fdstore gives a `Type=notify` service the socket unit's restart
+continuity without a socket unit. When the gateway binds its listener itself
+(no `LISTEN_FDS` handover), it sends `FDSTORE=1` with `FDNAME=listener` to
+`NOTIFY_SOCKET` with the descriptor attached; the service manager holds the
+socket open across `Restart=` and hands it back through the ordinary
+socket-activation handover on the next start. The kernel keeps queueing
+connects on the stored socket, so a restarting service — including a crash
+under `Restart=on-failure` — never presents a connection-refused window.
+fdstore requires `FileDescriptorStoreMax=` to be non-zero: it defaults to
+zero, which is why the preset sets `FileDescriptorStoreMax=1`. Stopping (not
+restarting) the service discards the store, and the next cold start binds
+normally.
+
+Composition rules:
+
+- Only a listener the daemon bound itself is stored. A `LISTEN_FDS`
+  handover — from a socket unit or a replayed fdstore — is not re-stored:
+  the manager already retains that socket, and duplicate store entries
+  would accumulate across restarts.
+- A replayed store arrives as ordinary socket activation, so a unit relying
+  on fdstore must not pass `--listen`/`BUS_PROXY_LISTEN`: the daemon
+  rejects the combination on the restart where the handover first appears.
+- With the socket unit enabled, the manager holds the listening socket
+  itself and the daemon never takes the self-bound branch;
+  `FileDescriptorStoreMax=1` is then simply unused.
+
+The handoff is best-effort: without a service manager it is a no-op, and a
+failed store only means restarts rebind with a brief refused window — logged
+at debug, never fatal.
 
 ## Limits and failure behavior
 

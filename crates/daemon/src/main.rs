@@ -1,4 +1,4 @@
-use std::{error::Error, net::SocketAddr, path::PathBuf, time::Duration};
+use std::{error::Error, net::SocketAddr, os::fd::AsFd, path::PathBuf, time::Duration};
 
 use bus_proxy_gateway::Config;
 use bus_proxy_router::{Limits, Router};
@@ -156,7 +156,18 @@ async fn main() -> Result<()> {
         let address = args
             .listen
             .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 4097)));
-        TcpListener::bind(address).await?
+        let listener = TcpListener::bind(address).await?;
+        // sd_notify fdstore: offer a self-bound listener to the manager so
+        // Restart= keeps the listening socket. Only this branch stores — a
+        // LISTEN_FDS handover (socket unit or replayed fdstore) is already
+        // retained by the manager, and re-storing would accumulate duplicate
+        // entries. Best-effort: without a manager this is a no-op, and a
+        // failed store only means restarts rebind.
+        if let Err(error) = systemd::fdstore(notify_socket.as_deref(), "listener", listener.as_fd())
+        {
+            tracing::debug!(%error, "listener fdstore handoff to the service manager failed");
+        }
+        listener
     };
     let address = listener.local_addr()?;
     let shutdown = CancellationToken::new();
