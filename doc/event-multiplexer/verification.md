@@ -1,3 +1,15 @@
+---
+type: Report
+title: Implementation and verification — first build and layout integration
+description: Preserved first-build evidence with later telemetry and directory-layout verification addenda.
+resource: /doc/event-multiplexer/verification.md
+status: verification record, not deployment or acceptance
+updated: 2026-10-11
+sources:
+  - resource: urn:opencode:session:ses_ed35c6048ffegHqs9lkaJQablf
+    title: Sol medium — mechanical layout, navigation, isolated checks and preserving primary reintegration
+---
+
 # Implementation and verification — 2026-10-10
 
 **First-build record.** The later
@@ -178,3 +190,36 @@ original proposed-path table with an explicit present-layout navigation note.
 
 This verifies the isolated branch, not integration or deployment: primary was
 still actively editing handover files, so its working copy was left untouched.
+
+## Primary reintegration — 2026-10-11
+
+The later explicit request to reintegrate was completed in primary at
+`287d502e`, a merge retaining both `4bb205ed` (the committed handover/queue-policy
+line) and `f46b85da` (telemetry extraction and layout follow-up). Primary was clean
+before integration; no other author's uncommitted work needed checkpointing.
+
+Eleven delete-versus-edit conflicts were resolved by carrying the latest primary
+versions into `components/` and `cli/daemon`. A byte comparison against the
+primary predecessor confirmed that every relocated file retains that version,
+except the intentional telemetry manifest/module and host startup changes from
+the telemetry branch. Startup retains the host's explicit ring TLS policy and
+blocking telemetry initialization. The HTTP draft remains byte-identical and
+the completion-checkpoint proposal remains unmodified. No ClickHouse feature,
+exporter, deployment or history squash was introduced.
+
+Integration-specific Rust 1.98.0 checks passed in primary:
+
+```sh
+cargo nextest run --locked
+cargo nextest run --workspace --all-features --locked
+cargo clippy --all-targets --locked -- -D warnings
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo fmt --all -- --check
+```
+
+Nextest passed 98 local-only tests and 99 all-feature tests, including exact and
+boundary-drain loopback handover, queue-policy shrink/zero-credit restoration,
+unavailable-OTLP startup and real OTLP request-span export/flush on SIGTERM.
+The primary predecessor now contains three intentionally ignored real-systemd
+manager tests; all three remain skipped. The prior isolated compatibility result
+is not claimed as a new primary compatibility run.

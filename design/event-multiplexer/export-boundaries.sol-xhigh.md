@@ -7,6 +7,8 @@ sources:
     title: Human direction — architecture first, external clickhouse_arrow, retain both implementations
   - resource: urn:opencode:session:ses_ed3752ffeffe68wHsEDWxGNfzJ
     title: Sol xhigh architectural pass and versioned source inspection
+  - resource: urn:opencode:session:ses_ed35c6048ffegHqs9lkaJQablf
+    title: Sol medium — present-layout navigation note and source-link repair; original proposal preserved
 ---
 
 # Export boundaries and consumer builds
