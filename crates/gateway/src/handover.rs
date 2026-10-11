@@ -293,18 +293,41 @@ impl Image {
     }
 }
 
-pub struct Frozen {
+struct Parked {
     listener: TcpListener,
     source: SourceOwner,
     clients: Vec<ClientOwner>,
-    image: Image,
+    image: Arc<Image>,
 }
 
+/// A preparation lease. The gateway retains custody of every parked I/O owner;
+/// abandoning this lease (including a canceled oneshot receive) resumes them.
+/// Closing duplicated descriptors never calls shutdown on a shared socket.
+pub struct Frozen {
+    image: Arc<Image>,
+    descriptors: Vec<(String, OwnedFd)>,
+    abandoned: CancellationToken,
+}
+
+impl Drop for Frozen {
+    fn drop(&mut self) {
+        self.abandoned.cancel();
+    }
+}
 impl Frozen {
     pub fn image(&self) -> &Image {
         &self.image
     }
     pub fn descriptors(&self) -> io::Result<Vec<(String, OwnedFd)>> {
+        self.descriptors
+            .iter()
+            .map(|(name, fd)| Ok((name.clone(), fd.as_fd().try_clone_to_owned()?)))
+            .collect()
+    }
+}
+
+impl Parked {
+    fn lease(&self, abandoned: CancellationToken) -> io::Result<Frozen> {
         let mut fds = vec![
             (
                 "listener".into(),
@@ -321,13 +344,17 @@ impl Frozen {
                 client.socket.as_fd().try_clone_to_owned()?,
             ));
         }
-        Ok(fds)
+        Ok(Frozen {
+            image: self.image.clone(),
+            descriptors: fds,
+            abandoned,
+        })
     }
 }
 
 enum Command {
     Freeze(oneshot::Sender<Result<Frozen, String>>),
-    Resume(Box<Frozen>, oneshot::Sender<()>),
+    Resume(String, oneshot::Sender<()>),
 }
 #[derive(Clone)]
 pub struct Controller(mpsc::Sender<Command>);
@@ -348,10 +375,12 @@ impl Controller {
     pub async fn resume(&self, frozen: Frozen) -> Result<(), String> {
         let (send, recv) = oneshot::channel();
         self.0
-            .send(Command::Resume(Box::new(frozen), send))
+            .send(Command::Resume(frozen.image.generation.clone(), send))
             .await
             .map_err(|_| "gateway closed")?;
-        recv.await.map_err(|_| "gateway closed".into())
+        let result = recv.await.map_err(|_| "gateway closed".into());
+        drop(frozen); // Keep the lease alive until the owners have actually resumed.
+        result
     }
 }
 
@@ -451,7 +480,7 @@ pub(crate) async fn run(
                             compatibility: compatibility(&state.config), listener_address: listener.local_addr().map_err(GatewayError::Listener)?, sockets,
                             source: source_owner.image.clone(), clients: parked.iter().map(|c| c.image.clone()).collect(), router: router_image,
                             metrics: [state.metrics.frames.load(Ordering::Relaxed), state.metrics.bytes.load(Ordering::Relaxed), state.metrics.failures.load(Ordering::Relaxed)] };
-                        Frozen { listener, source: source_owner, clients: parked, image }
+                         Parked { listener, source: source_owner, clients: parked, image: Arc::new(image) }
                     }
                     (source_owner, _) => {
                         let _ = state.router.thaw().await;
@@ -462,27 +491,34 @@ pub(crate) async fn run(
                         continue;
                     }
                 };
-                // If preparation's caller disappeared, resume rather than silently
-                // dropping every parked transport or leaving admission stopped.
-                let returned = match reply.send(Ok(frozen)) {
-                    Ok(()) => loop {
-                        tokio::select! {
-                            _ = shutdown.cancelled() => return Ok(()),
-                            command = control.0.recv() => match command {
-                                Some(Command::Resume(frozen, ack)) => { let _ = ack.send(()); break *frozen; }
-                                Some(Command::Freeze(reply)) => { let _ = reply.send(Err("handover already prepared".into())); }
-                                None => return Ok(()),
+                let abandoned = CancellationToken::new();
+                let mut ack = None;
+                match frozen.lease(abandoned.clone()) {
+                    Ok(lease) => {
+                        // Even send(Ok) can race with cancellation of its receiver.
+                        // Custody stays here; dropping the lease wakes this owner.
+                        let _ = reply.send(Ok(lease));
+                        loop {
+                            tokio::select! {
+                                _ = shutdown.cancelled() => return Ok(()),
+                                _ = abandoned.cancelled() => break,
+                                command = control.0.recv() => match command {
+                                    Some(Command::Resume(generation, sender)) if generation == frozen.image.generation => { ack = Some(sender); break; }
+                                    Some(Command::Resume(_, _)) => {},
+                                    Some(Command::Freeze(reply)) => { let _ = reply.send(Err("handover already prepared".into())); }
+                                    None => break,
+                                }
                             }
                         }
-                    },
-                    Err(Ok(frozen)) => frozen,
-                    Err(Err(_)) => unreachable!(),
-                };
-                listener = returned.listener;
+                    }
+                    Err(_) => { let _ = reply.send(Err("unable to duplicate parked descriptors; old owners resumed".into())); }
+                }
+                listener = frozen.listener;
                 state.router.thaw().await.map_err(|_| GatewayError::Configuration("router thaw failed"))?;
                 state = renewed(&state);
-                for client in returned.clients { connections.spawn(transport::client(client, state.clone())); }
-                source = spawn_source(state.clone(), Some(returned.source));
+                for client in frozen.clients { connections.spawn(transport::client(client, state.clone())); }
+                source = spawn_source(state.clone(), Some(frozen.source));
+                if let Some(ack) = ack { let _ = ack.send(()); }
             }
             accepted = async {
                 let permit = permits.clone().acquire_owned().await.expect("connection semaphore stays open");

@@ -179,6 +179,25 @@ async fn established_responses_and_live_only_source_survive_two_successors_and_a
     assert_eq!(active.next().await["id"], "after-abort");
     assert_eq!(legacy.next().await["id"], "after-abort");
 
+    // Explicit abandonment and a canceled receive retain owner custody in the
+    // gateway, then automatically resume without dropping parked transports.
+    drop(control.freeze().await.unwrap());
+    source
+        .write_all(&chunk(&event("ses_a", "abandoned-lease")))
+        .await
+        .unwrap();
+    assert_eq!(active.next().await["id"], "abandoned-lease");
+    assert_eq!(legacy.next().await["id"], "abandoned-lease");
+    let mut canceled = Box::pin(control.freeze());
+    assert!(futures_util::poll!(canceled.as_mut()).is_pending());
+    drop(canceled);
+    source
+        .write_all(&chunk(&event("ses_a", "canceled-request")))
+        .await
+        .unwrap();
+    assert_eq!(active.next().await["id"], "canceled-request");
+    assert_eq!(legacy.next().await["id"], "canceled-request");
+
     for round in 0..2 {
         if round == 0 {
             let before = router.snapshot().await.unwrap().counters.publications;

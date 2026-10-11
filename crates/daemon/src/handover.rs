@@ -96,11 +96,15 @@ impl Manager {
             .await?;
         parse_dump(&value)
     }
-    pub(crate) async fn preflight(&self, needed: usize) -> Result<()> {
-        let path = self.path().await?;
-        if self.property(&path, "MainPID").await?.as_u64() != Some(std::process::id() as u64) {
+    async fn require_owner(&self, path: &str) -> Result<()> {
+        if self.property(path, "MainPID").await?.as_u64() != Some(std::process::id() as u64) {
             return Err("handover unit MainPID does not own this process".into());
         }
+        Ok(())
+    }
+    pub(crate) async fn preflight(&self, needed: usize) -> Result<()> {
+        let path = self.path().await?;
+        self.require_owner(&path).await?;
         let restart = self.property(&path, "Restart").await?;
         if !matches!(restart.as_str(), Some("always" | "on-failure")) {
             return Err("handover requires Restart=always or on-failure (commit exits 75)".into());
@@ -127,6 +131,9 @@ impl Manager {
     }
 
     pub(crate) async fn invalidate(&self, socket: Option<&OsStr>, names: &[String]) -> Result<()> {
+        // A wrong unit can appear empty while the actual unit retains a stale
+        // restorable image. Verify custody before allowing any resumed I/O.
+        self.require_owner(&self.path().await?).await?;
         for name in names {
             systemd::remove(socket, name)?;
         }
@@ -200,16 +207,16 @@ impl Manager {
         }.await;
         if let Err(error) = prepared {
             // Never resume a generation while a restorable stale image remains.
-            if !offered.is_empty() {
-                if let Err(cleanup) = self.invalidate(socket, &offered).await {
-                    tracing::error!(%cleanup, "handover cleanup unverified; transports remain parked (operator must clear fdstore, then restart)");
-                    // Remain alive, with the cut immutable. A bounded reset failure
-                    // does not turn into an unplanned stale-snapshot restart.
-                    std::mem::forget(frozen);
-                    return Err(
-                        "handover cleanup unverified; generation is parked, not resumed".into(),
-                    );
-                }
+            if !offered.is_empty()
+                && let Err(cleanup) = self.invalidate(socket, &offered).await
+            {
+                tracing::error!(%cleanup, "handover cleanup unverified; transports remain parked (operator must clear fdstore, then restart)");
+                // Remain alive, with the cut immutable. A bounded reset failure
+                // does not turn into an unplanned stale-snapshot restart.
+                std::mem::forget(frozen);
+                return Err(
+                    "handover cleanup unverified; generation is parked, not resumed".into(),
+                );
             }
             control.resume(frozen).await.map_err(io::Error::other)?;
             return Err(error);
@@ -267,7 +274,8 @@ pub(crate) fn sealed_image(bytes: &[u8]) -> io::Result<OwnedFd> {
     Ok(file.into())
 }
 pub(crate) fn read_image(fd: OwnedFd) -> io::Result<handover::Image> {
-    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GET_SEALS) } & SEALS != SEALS {
+    let seals = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GET_SEALS) };
+    if seals < 0 || seals & SEALS != SEALS {
         return Err(io::Error::other("handover manifest must be sealed"));
     }
     let file = std::fs::File::from(fd);
@@ -292,6 +300,12 @@ mod tests {
         let mut bytes = [0; 13];
         file.read_exact_at(&mut bytes, 0).unwrap();
         assert_eq!(&bytes, b"private bytes");
+        assert!(
+            read_image(std::fs::File::open("/dev/null").unwrap().into())
+                .unwrap_err()
+                .to_string()
+                .contains("sealed")
+        );
     }
     #[test]
     fn dump_checks_names_and_exact_kernel_identity_not_just_count() {
