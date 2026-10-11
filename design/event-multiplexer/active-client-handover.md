@@ -1,12 +1,19 @@
 ---
-title: Active-client upgrade handoff registry
+title: Active-client upgrade handover registry
 status: proposal
 sources:
   - resource: urn:opencode:session:ses_ed3b65203ffebXKv17uH4LiZrB
     title: Memfd descriptor manifest and active-client upgrade direction
 ---
 
-# Active-client upgrade handoff registry
+# Active-client upgrade handover registry
+
+**Handover** names the coordinated transfer of live ownership. The **registry**
+describes the material and its owners; a **handover manifest** maps named
+descriptors and sections; a **state image** holds serialized semantic state and
+buffers. rkyv is an optional state-image encoding. Arrow/Polars exports and
+reactive tracing adapters can share the registry's data model; their encoding
+does not determine the ownership-transfer protocol.
 
 Use a **versioned memfd manifest plus named socket descriptors** to transfer a
 quiesced gateway generation. Keep the live registry in memory; write the transfer
@@ -24,7 +31,7 @@ Each row declares what the successor needs, how often it changes, and where the
 current implementation owns it. “Rebuild” means reconstruct from transferred
 semantic state rather than copying Rust objects or memory addresses.
 
-| Material | Handoff representation / disposition | Changes when | Current owner / gap |
+| Material | Handover representation / disposition | Changes when | Current owner / gap |
 | --- | --- | --- | --- |
 | Manifest envelope | Format version, required features, generation ID, producer version, source/config compatibility identifiers, snapshot clock/boot identity, section lengths and integrity metadata | Once per upgrade | New coordinator; no manifest exists |
 | Listening socket | Named FD, socket family/type/listening checks and bound address | Bind/adoption | Daemon `systemd.rs`; already retained |
@@ -96,7 +103,7 @@ This is same-host process-restart state, not persistence through power loss.
 - Update the in-memory descriptor registry on accept, role change and close.
 - Update semantic subscription records on subscribe/interest change/retirement.
 - Keep hot buffers with their current owners during normal service. No periodic
-  memfd rewrite is needed for planned handoff.
+  memfd rewrite is needed for planned handover.
 - Pause those owners, establish the cut, and serialize one immutable generation.
   Socket buffers may continue to fill while userspace is paused; TCP backpressure
   applies, so the pause must respect peer timeouts and buffer limits.
@@ -154,13 +161,13 @@ behavior. Do not carry stale IDs into a newly opened source epoch.
   connection associations and reconstruction preserving existing IDs and pending
   activation. Normal `Subscription::drop` closes and clears its queue.
 - **Tunnel ownership:** replace opaque copying with explicit per-direction state
-  before claiming tunnel handoff.
+  before claiming tunnel handover.
 - **Registry inspection:** enumerate every live material owner with
   `transferable`, `drain-required`, or `unsupported` and its reason. This makes
   upgrade readiness observable before committing to the transfer.
 - **Manager transaction:** increase `FileDescriptorStoreMax` for all sockets plus
   memfds, including both ends of tunnels and any overlapping generations. Specify
-  cleanup, store verification and restart behavior before enabling handoff.
+  cleanup, store verification and restart behavior before enabling handover.
 
 Systemd notifications are not a transactional object store: `sendmsg` success
 only means enqueue, and `BARRIER=1` confirms processing, not acceptance of every
@@ -169,7 +176,7 @@ polling/cleanup behavior for half-closed transferred transports. `FDNAME` is a
 label, not an atomic replacement key. Generation names and explicit removal
 avoid accidentally mixing old and new material.
 
-Verification should interrupt handoff at each ownership transition and exercise
+Verification should interrupt handover at each ownership transition and exercise
 partial chunk writes, source decoder fragments, queued opening frames, interest
 PUT races, stalled clients, tunnel half-closes, descriptor reordering/missing
 entries, incompatible manifests, repeated upgrades, and origin loss during the

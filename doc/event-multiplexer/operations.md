@@ -176,14 +176,14 @@ failed store only means restarts rebind with a brief refused window — logged
 at debug, never fatal.
 
 The store currently preserves only the listener, not accepted client connections.
-The proposed [active-client handoff registry](../../design/event-multiplexer/active-client-handoff.md)
+The proposed [active-client handover registry](../../design/event-multiplexer/active-client-handover.md)
 inventories the descriptors, subscription state, buffers and transfer boundaries.
-Active-client handoff for uninterrupted proxy upgrades is a future direction:
-it needs a quiesced handoff boundary, versioned subscription/queue state, and
+Active-client handover for uninterrupted proxy upgrades is a future direction:
+it needs a quiesced handover boundary, versioned subscription/queue state, and
 ownership transfer of each socket together with HTTP framing and buffered bytes.
 Duplicating a socket into fdstore alone does not preserve Hyper's connection
 state. In-flight HTTP requests and upgraded tunnels also need an explicit
-handoff strategy. Origin restarts still require client refresh because the event
+handover strategy. Origin restarts still require client refresh because the event
 source is live-only; preserving a downstream socket cannot recover missed events.
 
 ## Limits and failure behavior
