@@ -22,3 +22,21 @@ so transitive feature unification cannot switch it to an async client.
 Build independently with `cargo check -p bus-proxy-telemetry --locked`, or add
 `--features otlp`. The four existing core packages remain workspace default
 members; selecting `--workspace` also selects this optional composition package.
+
+Verification lanes:
+
+```sh
+cargo +1.98.0 test --locked
+cargo +1.98.0 test -p opencode-bus-proxy --no-default-features --features otel --locked
+cargo +1.98.0 test -p bus-proxy-telemetry --no-default-features --locked
+cargo +1.98.0 test --workspace --all-features --locked
+cargo +1.98.0 clippy --all-targets --locked -- -D warnings
+cargo +1.98.0 clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo +1.98.0 fmt --all -- --check
+```
+
+Dependency isolation can be inspected with `cargo tree -p opencode-bus-proxy
+--no-default-features --locked`: it must contain no opentelemetry, reqwest, Arrow
+or ClickHouse packages. Selecting protocol/router/gateway alone must likewise
+remain independent of telemetry. Systemd-manager handover tests remain ignored
+unless deliberately selected; no deployment is needed for telemetry tests.

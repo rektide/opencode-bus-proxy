@@ -41,7 +41,10 @@ impl ProviderConfig {
     }
 }
 
-/// Deterministic batch policy, overriding every SDK environment-sensitive field.
+/// Deterministic policy for the ordinary dedicated-thread batch processor.
+/// Queue size, batch size and delay override SDK environment defaults. Export
+/// timeouts belong to the exporter; experimental async-processor settings are
+/// not used by this composition.
 pub fn batch_config(queue: usize, batch: usize, delay: Duration) -> BatchConfig {
     sdk::trace::BatchConfigBuilder::default()
         .with_max_queue_size(queue)
