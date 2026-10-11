@@ -13,13 +13,13 @@ use std::{
 
 use bus_proxy_protocol::{Interest, Route, connected_frame, ready_frame};
 use bytes::Bytes;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 /// Backlog limits include ready/connected frames. Queue buffers allocate lazily.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Limits {
     pub queue_frames: usize,
     pub queue_bytes: usize,
@@ -62,7 +62,7 @@ impl Limits {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
     Legacy,
@@ -81,13 +81,17 @@ pub enum RouterError {
     Closed,
     #[error("invalid router limits")]
     InvalidLimits,
+    #[error("router is frozen for handover")]
+    Frozen,
+    #[error("invalid router handover image")]
+    InvalidImage,
 }
 
 /// Monotonic, saturating lifetime counters; no unbounded per-ID labels or history.
 /// `admissions`/`admitted_bytes` count domain frame offers accepted by queues,
 /// not network receipts. Handshake offers are counted separately. Publishing
 /// successfully does not mean every selected subscriber remained healthy.
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Counters {
     pub publications: u64,
     pub published_bytes: u64,
@@ -137,6 +141,30 @@ pub struct Snapshot {
     pub counters: Counters,
     pub gauges: Gauges,
 }
+
+/// Only export after all subscription receivers have parked. Freeze prevents
+/// actor mutations; it does not secretly stop independent queue receivers.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouterImage {
+    pub limits: Limits,
+    pub epoch: String,
+    pub subscriptions: Vec<SubscriptionImage>,
+    pub counters: Counters,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubscriptionImage {
+    pub id: String,
+    pub mode: Mode,
+    pub active: bool,
+    pub sessions: Vec<String>,
+    pub frames: Vec<FrameImage>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FrameImage(#[serde(with = "bus_proxy_protocol::buffer")] pub Vec<u8>);
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     // Queue locks protect only short, non-awaiting bookkeeping. Even poisoning
@@ -258,10 +286,20 @@ impl Subscription {
     pub async fn recv(&mut self) -> Option<Bytes> {
         self.queue.recv().await
     }
+
+    /// Relinquish the old guard without closing its queue. Only the handover
+    /// coordinator may use this, after exporting and irrevocably giving up I/O.
+    pub fn relinquish(mut self) {
+        self.commands = mpsc::channel(1).0;
+        self.id.clear();
+    }
 }
 
 impl Drop for Subscription {
     fn drop(&mut self) {
+        if self.id.is_empty() {
+            return;
+        }
         self.queue.close();
         // Cleanup cannot be lost: the queue's canceled flag persists if full,
         // and the actor reaps it periodically and before every command.
@@ -278,6 +316,8 @@ enum Command {
     Replace(String, Interest, Reply<()>),
     Publish(String, Route, Bytes, Reply<()>),
     Snapshot(Reply<Snapshot>),
+    Freeze(Reply<RouterImage>),
+    Thaw(Reply<()>),
     Remove(String),
     #[cfg(test)]
     Panic,
@@ -317,6 +357,7 @@ impl Router {
             legacy: HashSet::new(),
             sessions: HashMap::new(),
             counters: Counters::default(),
+            frozen: false,
         };
         let join = tokio::spawn(
             actor
@@ -386,6 +427,107 @@ impl Router {
     pub async fn snapshot(&self) -> Result<Snapshot, RouterError> {
         self.request(Command::Snapshot).await
     }
+
+    pub async fn freeze(&self) -> Result<RouterImage, RouterError> {
+        self.request(Command::Freeze).await
+    }
+
+    pub async fn thaw(&self) -> Result<(), RouterError> {
+        self.request(Command::Thaw).await
+    }
+
+    /// Rebuild indexes and guards without admitting new handshake frames or IDs.
+    pub fn import(
+        image: RouterImage,
+        limits: Limits,
+        shutdown: CancellationToken,
+    ) -> Result<(Self, tokio::task::JoinHandle<()>, Vec<Subscription>), RouterError> {
+        limits.validate()?;
+        if image.limits != limits
+            || image.epoch.is_empty()
+            || image.subscriptions.len() > limits.max_subscribers
+        {
+            return Err(RouterError::InvalidImage);
+        }
+        let (commands, receiver) = mpsc::channel(limits.command_capacity);
+        let token = CancellationToken::new();
+        let epoch_signal = Arc::new(Mutex::new(Some((image.epoch.clone(), token.clone()))));
+        let router = Self {
+            commands: commands.clone(),
+            epoch_signal: epoch_signal.clone(),
+            shutdown: shutdown.clone(),
+        };
+        let mut actor = Actor {
+            limits,
+            commands: commands.downgrade(),
+            epoch_signal,
+            epoch: Some((image.epoch, token.clone())),
+            subscribers: HashMap::new(),
+            active: HashSet::new(),
+            legacy: HashSet::new(),
+            sessions: HashMap::new(),
+            counters: image.counters,
+            frozen: false,
+        };
+        let mut guards = Vec::new();
+        for sub in image.subscriptions {
+            if !sub.id.starts_with("evsub_")
+                || sub.id.len() > 128
+                || actor.subscribers.contains_key(&sub.id)
+                || sub.sessions.len() > bus_proxy_protocol::SESSION_INTEREST_CAPACITY
+                || sub
+                    .sessions
+                    .iter()
+                    .any(|s| s.is_empty() || s.len() > bus_proxy_protocol::INTEREST_BYTE_CAPACITY)
+                || sub.sessions.iter().collect::<HashSet<_>>().len() != sub.sessions.len()
+                || (!sub.active && !sub.sessions.is_empty())
+                || (sub.mode == Mode::Legacy && (!sub.active || !sub.sessions.is_empty()))
+            {
+                return Err(RouterError::InvalidImage);
+            }
+            let queue = Arc::new(Queue::new(&actor.limits, token.clone()));
+            for frame in sub.frames {
+                queue
+                    .offer(Bytes::from(frame.0))
+                    .map_err(|_| RouterError::InvalidImage)?;
+            }
+            let span = tracing::info_span!("event.subscription", subscription_id = %sub.id, mode = ?sub.mode);
+            if sub.active {
+                actor.active.insert(sub.id.clone());
+            }
+            if sub.mode == Mode::Legacy {
+                actor.legacy.insert(sub.id.clone());
+            }
+            for session in &sub.sessions {
+                actor
+                    .sessions
+                    .entry(session.clone())
+                    .or_default()
+                    .insert(sub.id.clone());
+            }
+            guards.push(Subscription {
+                id: sub.id.clone(),
+                queue: queue.clone(),
+                commands: commands.clone(),
+            });
+            actor.subscribers.insert(
+                sub.id,
+                Subscriber {
+                    mode: sub.mode,
+                    active: sub.active,
+                    sessions: sub.sessions.into_iter().collect(),
+                    queue,
+                    span,
+                },
+            );
+        }
+        let join = tokio::spawn(
+            actor
+                .run(receiver, shutdown)
+                .instrument(tracing::info_span!("event.router")),
+        );
+        Ok((router, join, guards))
+    }
 }
 
 struct Subscriber {
@@ -407,6 +549,7 @@ struct Actor {
     legacy: HashSet<String>,
     sessions: HashMap<String, HashSet<String>>,
     counters: Counters,
+    frozen: bool,
 }
 
 impl Drop for Actor {
@@ -430,11 +573,11 @@ impl Actor {
                         Some(token) => token.cancelled().await,
                         None => std::future::pending().await,
                     }
-                } => self.retire_epoch(),
-                _ = reap.tick() => self.reap(),
+                }, if !self.frozen => self.retire_epoch(),
+                _ = reap.tick(), if !self.frozen => self.reap(),
                 command = receiver.recv() => {
                     let Some(command) = command else { break };
-                    if self.epoch.as_ref().is_some_and(|(_, token)| token.is_cancelled()) {
+                    if !self.frozen && self.epoch.as_ref().is_some_and(|(_, token)| token.is_cancelled()) {
                         self.retire_epoch();
                     }
                     self.handle(command);
@@ -496,7 +639,47 @@ impl Actor {
     }
 
     fn handle(&mut self, command: Command) {
+        if self.frozen {
+            match command {
+                Command::Thaw(reply) => {
+                    self.frozen = false;
+                    let _ = reply.send(Ok(()));
+                }
+                Command::Snapshot(reply) => {
+                    let _ = reply.send(Ok(self.snapshot()));
+                }
+                Command::Freeze(reply) => {
+                    let _ = reply.send(Err(RouterError::Frozen));
+                }
+                Command::Begin(_, reply)
+                | Command::End(_, reply)
+                | Command::Replace(_, _, reply)
+                | Command::Publish(_, _, _, reply) => {
+                    let _ = reply.send(Err(RouterError::Frozen));
+                }
+                Command::Subscribe(_, reply) => {
+                    let _ = reply.send(Err(RouterError::Frozen));
+                }
+                Command::Remove(_) => {}
+                #[cfg(test)]
+                Command::Panic => panic!("router fault-injection test"),
+            }
+            return;
+        }
         match command {
+            Command::Freeze(reply) => {
+                self.reap();
+                let result = self.export();
+                if result.is_ok() {
+                    self.frozen = true;
+                }
+                if reply.send(result).is_err() {
+                    self.frozen = false;
+                }
+            }
+            Command::Thaw(reply) => {
+                let _ = reply.send(Ok(()));
+            }
             Command::Begin(epoch, reply) => {
                 let result = if epoch.is_empty()
                     || self.epoch.as_ref().is_some_and(|(name, _)| name == &epoch)
@@ -723,11 +906,149 @@ impl Actor {
             gauges,
         }
     }
+
+    fn export(&self) -> Result<RouterImage, RouterError> {
+        let epoch = self
+            .epoch
+            .as_ref()
+            .filter(|(_, t)| !t.is_cancelled())
+            .ok_or(RouterError::Unavailable)?
+            .0
+            .clone();
+        let mut subscriptions = Vec::new();
+        for (id, sub) in &self.subscribers {
+            let mut sessions: Vec<_> = sub.sessions.iter().cloned().collect();
+            sessions.sort_unstable();
+            let backlog = lock(&sub.queue.backlog);
+            subscriptions.push(SubscriptionImage {
+                id: id.clone(),
+                mode: sub.mode,
+                active: sub.active,
+                sessions,
+                frames: backlog
+                    .frames
+                    .iter()
+                    .map(|b| FrameImage(b.to_vec()))
+                    .collect(),
+            });
+        }
+        subscriptions.sort_unstable_by(|a, b| a.id.cmp(&b.id));
+        Ok(RouterImage {
+            limits: self.limits.clone(),
+            epoch,
+            subscriptions,
+            counters: self.counters.clone(),
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn handover_preserves_ids_pending_interests_order_and_limits() {
+        let (old, stop, task) = router(16).await;
+        let active = old.subscribe(Mode::Controlled).await.unwrap();
+        let pending = old.subscribe(Mode::Controlled).await.unwrap();
+        let legacy = old.subscribe(Mode::Legacy).await.unwrap();
+        let id = active.id().to_owned();
+        old.replace(
+            id.clone(),
+            Interest {
+                sessions: vec!["ses_a".into()],
+            },
+        )
+        .await
+        .unwrap();
+        old.publish(
+            "one".into(),
+            Route::Session {
+                session_id: Some("ses_a".into()),
+            },
+            Bytes::from_static(b"queued-one"),
+        )
+        .await
+        .unwrap();
+        let image = old.freeze().await.unwrap();
+        assert_eq!(
+            old.publish("one".into(), Route::Broadcast, Bytes::new())
+                .await,
+            Err(RouterError::Frozen)
+        );
+        let image: RouterImage =
+            serde_json::from_slice(&serde_json::to_vec(&image).unwrap()).unwrap();
+        let limits = image.limits.clone();
+        assert_eq!(
+            image
+                .subscriptions
+                .iter()
+                .find(|s| s.id == pending.id())
+                .unwrap()
+                .active,
+            false
+        );
+        // Real transport owners park their guards; no normal drop before export.
+        active.relinquish();
+        pending.relinquish();
+        legacy.relinquish();
+        stop.cancel();
+        task.await.unwrap();
+        let new_stop = CancellationToken::new();
+        let (new, new_task, mut guards) = Router::import(image, limits, new_stop.clone()).unwrap();
+        let sub = guards.iter_mut().find(|s| s.id() == id).unwrap();
+        assert!(
+            std::str::from_utf8(&sub.recv().await.unwrap())
+                .unwrap()
+                .contains(&id)
+        );
+        assert!(
+            std::str::from_utf8(&sub.recv().await.unwrap())
+                .unwrap()
+                .contains("server.connected")
+        );
+        assert_eq!(sub.recv().await.unwrap(), b"queued-one"[..]);
+        new.publish(
+            "one".into(),
+            Route::Session {
+                session_id: Some("ses_b".into()),
+            },
+            Bytes::from_static(b"not-selected"),
+        )
+        .await
+        .unwrap();
+        new.publish(
+            "one".into(),
+            Route::Session {
+                session_id: Some("ses_a".into()),
+            },
+            Bytes::from_static(b"queued-two"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(sub.recv().await.unwrap(), b"queued-two"[..]);
+        let snapshot = new.snapshot().await.unwrap();
+        assert_eq!(snapshot.gauges.pending, 1);
+        assert_eq!(snapshot.counters.epochs_started, 1);
+        new_stop.cancel();
+        new_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn aborted_freeze_thaws_without_retirement() {
+        let (router, stop, task) = router(8).await;
+        let mut sub = router.subscribe(Mode::Legacy).await.unwrap();
+        router.freeze().await.unwrap();
+        router.thaw().await.unwrap();
+        assert!(
+            std::str::from_utf8(&sub.recv().await.unwrap())
+                .unwrap()
+                .contains("server.connected")
+        );
+        assert_eq!(router.snapshot().await.unwrap().counters.epochs_ended, 0);
+        stop.cancel();
+        task.await.unwrap();
+    }
 
     async fn router(capacity: usize) -> (Router, CancellationToken, tokio::task::JoinHandle<()>) {
         let shutdown = CancellationToken::new();

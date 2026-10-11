@@ -1,4 +1,46 @@
 use crate::ProtocolError;
+use serde::{Deserialize, Serialize};
+
+/// Exact incremental parser state, versioned by the enclosing handover format.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DecoderImage {
+    frame_bytes: u64,
+    #[serde(with = "crate::buffer")]
+    line: Vec<u8>,
+    #[serde(with = "crate::buffer")]
+    data: Vec<u8>,
+    has_data: bool,
+    skip_lf: bool,
+    #[serde(with = "crate::buffer")]
+    prefix: Vec<u8>,
+    started: bool,
+}
+
+#[cfg(test)]
+mod handover_tests {
+    use super::*;
+
+    #[test]
+    fn every_cut_preserves_bom_crlf_and_partial_data() {
+        let wire = b"\xef\xbb\xbfdata: first\r\ndata: second\r\n\r\n: beat\r\ndata: third\n\n";
+        for cut in 0..=wire.len() {
+            let mut old = SseDecoder::new(1024);
+            let mut frames = old.push(&wire[..cut]).unwrap();
+            let image =
+                serde_json::from_slice(&serde_json::to_vec(&old.export().unwrap()).unwrap())
+                    .unwrap();
+            let mut new = SseDecoder::import(image, 1024).unwrap();
+            frames.extend(new.push(&wire[cut..]).unwrap());
+            new.finish().unwrap();
+            assert_eq!(
+                frames,
+                [b"first\nsecond".to_vec(), b"third".to_vec()],
+                "cut {cut}"
+            );
+        }
+    }
+}
 
 /// Incremental SSE data decoder. Each byte is visited a constant number of times,
 /// even for one-byte input chunks. The bound counts all non-CR/LF bytes between
@@ -21,6 +63,48 @@ pub struct SseDecoder {
 }
 
 impl SseDecoder {
+    pub fn export(&self) -> Result<DecoderImage, ProtocolError> {
+        if self.closed {
+            return Err(ProtocolError::DecoderClosed);
+        }
+        Ok(DecoderImage {
+            frame_bytes: self.frame_bytes as u64,
+            line: self.line.clone(),
+            data: self.data.clone(),
+            has_data: self.has_data,
+            skip_lf: self.skip_lf,
+            prefix: self.prefix.clone(),
+            started: self.started,
+        })
+    }
+
+    pub fn import(image: DecoderImage, limit: usize) -> Result<Self, ProtocolError> {
+        // Data has one synthetic LF per data field, so it can exceed the counted
+        // value by at most the number of counted field prefixes.
+        if image.frame_bytes > limit as u64
+            || image.line.len() > limit
+            || image.data.len() > limit.saturating_mul(2)
+            || image.line.len() as u64 > image.frame_bytes
+            || image.prefix.len() > 2
+            || (image.started && !image.prefix.is_empty())
+            || (!image.started && !b"\xef\xbb\xbf".starts_with(&image.prefix))
+            || (!image.has_data && !image.data.is_empty())
+        {
+            return Err(ProtocolError::InvalidEvent);
+        }
+        Ok(Self {
+            limit,
+            frame_bytes: image.frame_bytes as usize,
+            line: image.line,
+            data: image.data,
+            has_data: image.has_data,
+            skip_lf: image.skip_lf,
+            prefix: image.prefix,
+            started: image.started,
+            closed: false,
+        })
+    }
+
     pub fn new(max_frame_bytes: usize) -> Self {
         Self {
             limit: max_frame_bytes,

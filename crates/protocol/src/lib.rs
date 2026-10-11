@@ -4,7 +4,24 @@ mod interest;
 mod sse;
 
 pub use interest::{Interest, InterestError, decode_interest};
-pub use sse::SseDecoder;
+pub use sse::{DecoderImage, SseDecoder};
+
+/// Private handover buffers use base64, not arrays of JSON numbers. This is not
+/// an inspection API: these bytes can contain event payloads.
+pub mod buffer {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(value: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&STANDARD.encode(value))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        STANDARD
+            .decode(String::deserialize(deserializer)?)
+            .map_err(serde::de::Error::custom)
+    }
+}
 
 use bytes::Bytes;
 use serde::Deserialize;
