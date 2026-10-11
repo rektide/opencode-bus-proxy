@@ -1,0 +1,210 @@
+// Uncompiled exploratory draft, parked when the user requested architectural
+// review using the clickhouse_arrow crate. Not selected for implementation.
+//! Direct ClickHouse inserts: Arrow IPC streaming format over the HTTP interface.
+use std::{fmt, io::Read, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
+
+use arrow_array::{ArrayRef, RecordBatch, StringArray, TimestampNanosecondArray, UInt32Array, UInt64Array, UInt8Array};
+use arrow_ipc::writer::StreamWriter;
+use arrow_schema::{DataType, Field, Schema, TimeUnit};
+use opentelemetry::{Array, KeyValue, Value, trace::{SpanId, Status}};
+use opentelemetry_sdk::{Resource, error::{OTelSdkError, OTelSdkResult}, trace::{SpanData, SpanExporter}};
+use reqwest::{Url, blocking::Client, header::{HeaderMap, HeaderValue}};
+use serde_json::{Value as Json, json};
+
+use super::setting;
+use crate::Result;
+
+pub(super) struct Exporter {
+    client: Client,
+    url: Url,
+    resource: Resource,
+}
+
+// Never include credentials (or a client containing them) in diagnostics.
+impl fmt::Debug for Exporter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClickHouseArrowExporter").finish_non_exhaustive()
+    }
+}
+
+fn identifier(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    bytes.next().is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+fn insert_url(endpoint: &str, database: &str, table: &str) -> Result<Url> {
+    let mut url = Url::parse(endpoint).map_err(|_| "invalid BUS_PROXY_CLICKHOUSE_ENDPOINT URL")?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none()
+        || !url.username().is_empty() || url.password().is_some()
+        || url.query().is_some() || url.fragment().is_some()
+    {
+        return Err("BUS_PROXY_CLICKHOUSE_ENDPOINT must be HTTP(S), without credentials, query, or fragment".into());
+    }
+    if !identifier(database) || !identifier(table) {
+        return Err("ClickHouse database/table must be simple identifiers: [A-Za-z_][A-Za-z0-9_]*".into());
+    }
+    url.query_pairs_mut()
+        .append_pair("query", &format!("INSERT INTO `{database}`.`{table}` FORMAT ArrowStream"))
+        .append_pair("wait_end_of_query", "1")
+        .append_pair("async_insert", "0")
+        .append_pair("input_format_arrow_allow_missing_columns", "0");
+    Ok(url)
+}
+
+impl Exporter {
+    pub(super) fn from_env() -> Result<Self> {
+        let url = insert_url(
+            &setting("BUS_PROXY_CLICKHOUSE_ENDPOINT").unwrap_or_else(|| "http://localhost:8123".into()),
+            &setting("BUS_PROXY_CLICKHOUSE_DATABASE").unwrap_or_else(|| "default".into()),
+            &setting("BUS_PROXY_CLICKHOUSE_TABLE").unwrap_or_else(|| "bus_proxy_traces".into()),
+        )?;
+        let timeout = setting("BUS_PROXY_CLICKHOUSE_TIMEOUT_MS").unwrap_or_else(|| "3000".into())
+            .parse::<u64>().ok().filter(|n| *n > 0)
+            .ok_or("BUS_PROXY_CLICKHOUSE_TIMEOUT_MS must be a positive integer")?;
+        let user = setting("BUS_PROXY_CLICKHOUSE_USER").unwrap_or_else(|| "default".into());
+        let password = if let Some(file) = setting("BUS_PROXY_CLICKHOUSE_PASSWORD_FILE") {
+            std::fs::read_to_string(file)?.trim_end_matches(['\r', '\n']).to_owned()
+        } else {
+            setting("BUS_PROXY_CLICKHOUSE_PASSWORD").unwrap_or_default()
+        };
+        let mut headers = HeaderMap::new();
+        for (name, value) in [("x-clickhouse-user", user), ("x-clickhouse-key", password)] {
+            let mut value = HeaderValue::from_str(&value)
+                .map_err(|_| "ClickHouse credentials are not valid HTTP header values")?;
+            value.set_sensitive(true);
+            headers.insert(name, value);
+        }
+        // reqwest's blocking client owns a runtime; construct it off Tokio.
+        let client = std::thread::spawn(move || Client::builder()
+            .timeout(Duration::from_millis(timeout))
+            .redirect(reqwest::redirect::Policy::none())
+            .default_headers(headers).build())
+            .join().map_err(|_| "ClickHouse HTTP client initialization panicked")??;
+        Ok(Self { client, url, resource: Resource::builder_empty().build() })
+    }
+
+    fn send(&self, batch: &[SpanData]) -> Result<()> {
+        if batch.is_empty() { return Ok(()); }
+        let body = encode(batch, &self.resource)?;
+        let response = self.client.post(self.url.clone())
+            .header("content-type", "application/vnd.apache.arrow.stream")
+            .body(body).send().map_err(|error| error.without_url())?;
+        let status = response.status();
+        let exception = response.headers().get("x-clickhouse-exception-code").is_some();
+        // INSERT has an empty success body. Also catch errors sent after HTTP 200,
+        // and bound memory when a proxy returns an unexpectedly large response.
+        let mut body = Vec::new();
+        response.take(16 * 1024 + 1).read_to_end(&mut body)?;
+        if !status.is_success() || exception || body.iter().any(|b| !b.is_ascii_whitespace()) {
+            return Err(format!("ClickHouse insert failed (HTTP {status}, exception={exception}, nonempty_response={})", !body.is_empty()).into());
+        }
+        Ok(())
+    }
+}
+
+impl SpanExporter for Exporter {
+    async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
+        // SdkTracerProvider::with_batch_exporter runs this on its dedicated thread.
+        self.send(&batch).map_err(|error| {
+            // Deliberately outside proxy-owned targets to avoid export feedback.
+            tracing::warn!(target: "clickhouse_exporter", %error, spans = batch.len(), "trace batch export failed");
+            OTelSdkError::InternalFailure(error.to_string())
+        })
+    }
+
+    fn set_resource(&mut self, resource: &Resource) {
+        self.resource = resource.clone();
+    }
+}
+
+fn value_json(value: &Value) -> Json {
+    match value {
+        Value::Bool(v) => json!(v),
+        Value::I64(v) => json!(v),
+        Value::F64(v) if v.is_finite() => json!(v),
+        Value::String(v) => json!(v.as_str()),
+        Value::Array(Array::Bool(v)) => json!(v),
+        Value::Array(Array::I64(v)) => json!(v),
+        Value::Array(Array::F64(v)) => v.iter().map(|v| value_json(&Value::F64(*v))).collect(),
+        Value::Array(Array::String(v)) => v.iter().map(|v| json!(v.as_str())).collect(),
+        // JSON has no non-finite numbers; retain their textual value.
+        other => json!(other.to_string()),
+    }
+}
+
+fn attributes<'a>(values: impl IntoIterator<Item = &'a KeyValue>) -> Json {
+    Json::Object(values.into_iter().map(|kv| (kv.key.to_string(), value_json(&kv.value))).collect())
+}
+
+fn nanos(time: SystemTime) -> Result<i64> {
+    let nanos = match time.duration_since(UNIX_EPOCH) {
+        Ok(duration) => i128::try_from(duration.as_nanos())?,
+        Err(error) => -i128::try_from(error.duration().as_nanos())?,
+    };
+    Ok(i64::try_from(nanos)?)
+}
+
+fn strings(batch: &[SpanData], get: impl Fn(&SpanData) -> String) -> ArrayRef {
+    Arc::new(StringArray::from(batch.iter().map(get).collect::<Vec<_>>()))
+}
+
+fn encode(batch: &[SpanData], resource: &Resource) -> Result<Vec<u8>> {
+    let resource_attributes = Json::Object(resource.iter()
+        .map(|(key, value)| (key.to_string(), value_json(value))).collect()).to_string();
+    let service = resource.get(&opentelemetry::Key::new("service.name"))
+        .map(|value| value.to_string()).unwrap_or_default();
+    let mut columns: Vec<(&str, ArrayRef)> = vec![
+        ("Timestamp", Arc::new(TimestampNanosecondArray::from(batch.iter()
+            .map(|span| nanos(span.start_time)).collect::<Result<Vec<_>>>()?).with_timezone("UTC"))),
+        ("Duration", Arc::new(UInt64Array::from(batch.iter().map(|span| {
+            Ok(u64::try_from(span.end_time.duration_since(span.start_time).unwrap_or_default().as_nanos())?)
+        }).collect::<Result<Vec<_>>>()?))),
+        ("TraceId", strings(batch, |s| s.span_context.trace_id().to_string())),
+        ("SpanId", strings(batch, |s| s.span_context.span_id().to_string())),
+        ("ParentSpanId", strings(batch, |s| if s.parent_span_id == SpanId::INVALID { String::new() } else { s.parent_span_id.to_string() })),
+        ("TraceState", strings(batch, |s| s.span_context.trace_state().header())),
+        ("TraceFlags", Arc::new(UInt8Array::from(batch.iter().map(|s| s.span_context.trace_flags().to_u8()).collect::<Vec<_>>()))),
+        ("ParentIsRemote", Arc::new(UInt8Array::from(batch.iter().map(|s| u8::from(s.parent_span_is_remote)).collect::<Vec<_>>()))),
+        ("SpanName", strings(batch, |s| s.name.to_string())),
+        ("SpanKind", strings(batch, |s| format!("{:?}", s.span_kind))),
+        ("ServiceName", strings(batch, |_| service.clone())),
+        ("ResourceAttributes", strings(batch, |_| resource_attributes.clone())),
+        ("ResourceSchemaUrl", strings(batch, |_| resource.schema_url().unwrap_or_default().to_owned())),
+        ("ScopeName", strings(batch, |s| s.instrumentation_scope.name().to_owned())),
+        ("ScopeVersion", strings(batch, |s| s.instrumentation_scope.version().unwrap_or_default().to_owned())),
+        ("ScopeSchemaUrl", strings(batch, |s| s.instrumentation_scope.schema_url().unwrap_or_default().to_owned())),
+        ("ScopeAttributes", strings(batch, |s| attributes(s.instrumentation_scope.attributes()).to_string())),
+        ("SpanAttributes", strings(batch, |s| attributes(&s.attributes).to_string())),
+        ("StatusCode", strings(batch, |s| match s.status { Status::Unset => "Unset", Status::Ok => "Ok", Status::Error { .. } => "Error" }.into())),
+        ("StatusMessage", strings(batch, |s| match &s.status { Status::Error { description } => description.to_string(), _ => String::new() })),
+    ];
+    let events = batch.iter().map(|s| {
+        s.events.iter().map(|e| Ok(json!({
+            "timestamp_unix_nano": nanos(e.timestamp)?, "name": e.name,
+            "attributes": attributes(&e.attributes), "dropped_attributes_count": e.dropped_attributes_count,
+        }))).collect::<Result<Vec<_>>>().map(|events| json!(events).to_string())
+    }).collect::<Result<Vec<_>>>()?;
+    columns.push(("Events", Arc::new(StringArray::from(events))));
+    columns.push(("Links", strings(batch, |s| json!(s.links.iter().map(|link| json!({
+        "trace_id": link.span_context.trace_id().to_string(), "span_id": link.span_context.span_id().to_string(),
+        "trace_state": link.span_context.trace_state().header(), "trace_flags": link.span_context.trace_flags().to_u8(),
+        "is_remote": link.span_context.is_remote(), "attributes": attributes(&link.attributes),
+        "dropped_attributes_count": link.dropped_attributes_count,
+    })).collect::<Vec<_>>()).to_string())));
+    for (name, values) in [
+        ("DroppedAttributesCount", batch.iter().map(|s| s.dropped_attributes_count).collect::<Vec<_>>()),
+        ("DroppedEventsCount", batch.iter().map(|s| s.events.dropped_count).collect()),
+        ("DroppedLinksCount", batch.iter().map(|s| s.links.dropped_count).collect()),
+    ] {
+        columns.push((name, Arc::new(UInt32Array::from(values))));
+    }
+    let schema = Arc::new(Schema::new(columns.iter().map(|(name, array)| Field::new(*name, array.data_type().clone(), false)).collect::<Vec<_>>()));
+    let record = RecordBatch::try_new(schema.clone(), columns.into_iter().map(|(_, array)| array).collect())?;
+    let mut output = Vec::new();
+    let mut writer = StreamWriter::try_new(&mut output, &schema)?;
+    writer.write(&record)?;
+    writer.finish()?;
+    drop(writer);
+    Ok(output)
+}
