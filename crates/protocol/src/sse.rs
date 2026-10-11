@@ -17,6 +17,16 @@ pub struct DecoderImage {
     started: bool,
 }
 
+impl DecoderImage {
+    /// Private-buffer occupancy, for bounding an enclosing transfer image.
+    pub fn retained_bytes(&self) -> usize {
+        self.line
+            .len()
+            .saturating_add(self.data.len())
+            .saturating_add(self.prefix.len())
+    }
+}
+
 /// Incremental SSE data decoder. Each byte is visited a constant number of times,
 /// even for one-byte input chunks. The bound counts all non-CR/LF bytes between
 /// blank lines, including field prefixes/comments; a leading UTF-8 BOM is exempt.

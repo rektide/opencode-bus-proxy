@@ -85,6 +85,8 @@ pub enum RouterError {
     Frozen,
     #[error("invalid router handover image")]
     InvalidImage,
+    #[error("router handover image exceeds its serialization budget")]
+    ImageLimit,
 }
 
 /// Monotonic, saturating lifetime counters; no unbounded per-ID labels or history.
@@ -320,7 +322,7 @@ enum Command {
     Replace(String, Interest, Reply<()>),
     Publish(String, Route, Bytes, Reply<()>),
     Snapshot(Reply<Snapshot>),
-    Freeze(Reply<RouterImage>),
+    Freeze(usize, Reply<RouterImage>),
     Thaw(Reply<()>),
     Remove(String),
     #[cfg(test)]
@@ -433,7 +435,14 @@ impl Router {
     }
 
     pub async fn freeze(&self) -> Result<RouterImage, RouterError> {
-        self.request(Command::Freeze).await
+        self.freeze_bounded(usize::MAX).await
+    }
+
+    /// Conservative JSON/base64 budget, checked before copying queued frames.
+    /// Call only after independent receivers have parked, as for `freeze`.
+    pub async fn freeze_bounded(&self, json_budget: usize) -> Result<RouterImage, RouterError> {
+        self.request(|reply| Command::Freeze(json_budget, reply))
+            .await
     }
 
     pub async fn thaw(&self) -> Result<(), RouterError> {
@@ -652,7 +661,7 @@ impl Actor {
                 Command::Snapshot(reply) => {
                     let _ = reply.send(Ok(self.snapshot()));
                 }
-                Command::Freeze(reply) => {
+                Command::Freeze(_, reply) => {
                     let _ = reply.send(Err(RouterError::Frozen));
                 }
                 Command::Begin(_, reply)
@@ -671,9 +680,9 @@ impl Actor {
             return;
         }
         match command {
-            Command::Freeze(reply) => {
+            Command::Freeze(json_budget, reply) => {
                 self.reap();
-                let result = self.export();
+                let result = self.export(json_budget);
                 if result.is_ok() {
                     self.frozen = true;
                 }
@@ -911,14 +920,41 @@ impl Actor {
         }
     }
 
-    fn export(&self) -> Result<RouterImage, RouterError> {
+    fn export(&self, json_budget: usize) -> Result<RouterImage, RouterError> {
         let epoch = self
             .epoch
             .as_ref()
             .filter(|(_, t)| !t.is_cancelled())
             .ok_or(RouterError::Unavailable)?
             .0
-            .clone();
+            .as_str();
+        // Queue allowance can total many GiB even when frames physically share
+        // storage. Refuse an oversized private image before fan-out duplication.
+        // JSON strings take at most six bytes per UTF-8 input byte; base64 takes
+        // four per three input bytes. Fixed margins include keys/array separators.
+        let mut weight = 4096usize.saturating_add(epoch.len().saturating_mul(6));
+        for (id, sub) in &self.subscribers {
+            weight = weight
+                .saturating_add(2048)
+                .saturating_add(id.len().saturating_mul(6));
+            for session in &sub.sessions {
+                weight = weight
+                    .saturating_add(4)
+                    .saturating_add(session.len().saturating_mul(6));
+            }
+            let backlog = lock(&sub.queue.backlog);
+            for frame in &backlog.frames {
+                weight = weight
+                    .saturating_add(4)
+                    .saturating_add(frame.len().div_ceil(3).saturating_mul(4));
+            }
+            if weight > json_budget {
+                return Err(RouterError::ImageLimit);
+            }
+        }
+        if weight > json_budget {
+            return Err(RouterError::ImageLimit);
+        }
         let mut subscriptions = Vec::new();
         for (id, sub) in &self.subscribers {
             let mut sessions: Vec<_> = sub.sessions.iter().cloned().collect();
@@ -939,7 +975,7 @@ impl Actor {
         subscriptions.sort_unstable_by(|a, b| a.id.cmp(&b.id));
         Ok(RouterImage {
             limits: self.limits.clone(),
-            epoch,
+            epoch: epoch.to_owned(),
             subscriptions,
             counters: self.counters.clone(),
         })
@@ -1049,6 +1085,36 @@ mod tests {
                 .contains("server.connected")
         );
         assert_eq!(router.snapshot().await.unwrap().counters.epochs_ended, 0);
+        stop.cancel();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bounded_freeze_rejects_before_copying_and_does_not_retire_or_freeze() {
+        let (router, stop, task) = router(8).await;
+        let mut sub = router.subscribe(Mode::Legacy).await.unwrap();
+        let ready = sub.recv().await.unwrap();
+        router
+            .publish(
+                "one".into(),
+                Route::Broadcast,
+                Bytes::from_static(b"exact-backlog"),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            router.freeze_bounded(1).await,
+            Err(RouterError::ImageLimit)
+        ));
+        assert_eq!(sub.recv().await.unwrap(), b"exact-backlog"[..]);
+        router
+            .publish("one".into(), Route::Broadcast, ready)
+            .await
+            .unwrap();
+        let image = router.freeze_bounded(65536).await.unwrap();
+        assert!(serde_json::to_vec(&image).unwrap().len() <= 65536);
+        assert_eq!(image.counters.epochs_ended, 0);
+        router.thaw().await.unwrap();
         stop.cancel();
         task.await.unwrap();
     }

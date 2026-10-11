@@ -133,10 +133,22 @@ fn compatibility(config: &Config) -> String {
 /// Versioned, bounded JSON + base64 envelope. Hash protects accidental corruption,
 /// not trust: only the service manager may supply this sealed private memfd.
 pub fn encode(image: &Image) -> io::Result<Vec<u8>> {
-    let body = serde_json::to_vec(image).map_err(io::Error::other)?;
-    if body.len() > IMAGE_LIMIT {
-        return Err(io::Error::other("handover image exceeds 256 MiB"));
+    struct Bounded(Vec<u8>);
+    impl io::Write for Bounded {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if bytes.len() > IMAGE_LIMIT - self.0.len() {
+                return Err(io::Error::other("handover image exceeds 256 MiB"));
+            }
+            self.0.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
+    let mut body = Bounded(Vec::new());
+    serde_json::to_writer(&mut body, image).map_err(io::Error::other)?;
+    let body = body.0;
     let mut output = b"OBPHO001".to_vec();
     output.extend_from_slice(&(body.len() as u64).to_le_bytes());
     output.extend_from_slice(&Sha256::digest(&body));
@@ -464,7 +476,24 @@ pub(crate) async fn run(
                 state.tasks.close();
                 state.tasks.wait().await;
                 let parked_source = (&mut source).await.map_err(GatewayError::SourceTask)?;
-                let router_image = state.router.freeze().await;
+                // Bound aggregate transport + router image duplication before
+                // cloning parked outputs or queue frames into the private image.
+                let transport_weight = parked_source.as_ref().map_or(IMAGE_LIMIT, |source| {
+                    let decoder = &source.image.decoder;
+                    let mut weight = 8192usize;
+                    weight = weight.saturating_add(source.image.buffer.len().saturating_mul(2))
+                        .saturating_add(decoder.retained_bytes().saturating_mul(2));
+                    weight = weight.saturating_add(source.image.epoch.as_ref().map_or(0, |e| e.len().saturating_mul(6)));
+                    for client in &parked {
+                        weight = weight.saturating_add(2048)
+                            .saturating_add(client.image.output.len().saturating_mul(2))
+                            .saturating_add(client.image.key.len().saturating_mul(6))
+                            .saturating_add(client.image.subscription.len().saturating_mul(6));
+                    }
+                    weight
+                });
+                let router_image = if transport_weight >= IMAGE_LIMIT { Err(bus_proxy_router::RouterError::ImageLimit) }
+                    else { state.router.freeze_bounded(IMAGE_LIMIT - transport_weight).await };
                 let frozen = match (parked_source, router_image) {
                     (Some(source_owner), Ok(router_image)) => {
                         let generation = format!("{:016x}", rand::random::<u64>());
@@ -487,7 +516,7 @@ pub(crate) async fn run(
                         state = renewed(&state);
                         for client in parked { connections.spawn(transport::client(client, state.clone())); }
                         source = spawn_source(state.clone(), source_owner);
-                        let _ = reply.send(Err("source failed while establishing the handover cut; old epoch cannot be preserved".into()));
+                        let _ = reply.send(Err("source readiness, router or image budget prevented exporting the cut; old owners resumed (a failed source still retires its epoch)".into()));
                         continue;
                     }
                 };
