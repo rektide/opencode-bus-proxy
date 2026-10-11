@@ -9,6 +9,8 @@ sources:
     title: Sol xhigh architectural pass and versioned source inspection
   - resource: urn:opencode:session:ses_ed35c6048ffegHqs9lkaJQablf
     title: Sol medium — present-layout navigation note and source-link repair; original proposal preserved
+  - resource: opencode://ses_ed2d6efafffeJebEhJ6FDRWIeF
+    title: Native implementation navigation addendum; original proposal and HTTP experiment preserved
 ---
 
 # Export boundaries and consumer builds
@@ -22,7 +24,14 @@ its schema, configuration, or runtime design.
 `telemetry/core`, and the existing packages now live at
 `components/{protocol,router,gateway}` and `cli/daemon`. The original observations
 and proposed path table below are preserved as proposal evidence; updated source
-links navigate the present layout. No ClickHouse package has been implemented.
+links navigate the present layout. The follow-on commissioned native implementation
+now lives at [`telemetry/clickhouse-native`](../../telemetry/clickhouse-native/README.md),
+with the researched collector/HyperDX-compatible projection at
+[`telemetry/arrow`](../../telemetry/arrow/README.md). Their maintained guides and
+[operations](../../doc/event-multiplexer/operations.md#native-clickhouse-trace-export)
+describe actual APIs, verified server versions and newly found upstream caveats;
+the original audit/proposals below are preserved as evidence, not retroactive
+claims that this architectural pass implemented them. The HTTP draft is unchanged.
 
 ## Recommendation
 

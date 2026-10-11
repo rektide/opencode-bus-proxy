@@ -3,9 +3,13 @@ name = "bus-proxy-clickhouse-native"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+# Cross-package disposable-server/schema fixtures are workspace-maintainer tests.
+# The distributable library and its source-local unit tests are self-contained.
+exclude = ["tests"]
 
 [features]
 default = []
+otel = ["dep:opentelemetry_sdk", "dep:bus-proxy-export-arrow", "bus-proxy-export-arrow/otel-traces"]
 
 [dependencies]
 arrow-array.workspace = true
@@ -14,6 +18,9 @@ futures-util.workspace = true
 thiserror.workspace = true
 tokio = { version = "1", default-features = false, features = ["rt", "time", "sync", "net", "macros"] }
 rustls = { version = "0.23", default-features = false }
+opentelemetry_sdk = { workspace = true, optional = true }
+bus-proxy-export-arrow = { workspace = true, optional = true }
+tracing.workspace = true
 
 [dev-dependencies]
 arrow-schema.workspace = true

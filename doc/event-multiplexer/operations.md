@@ -1,3 +1,22 @@
+---
+type: OperationsGuide
+title: Operating the event gateway
+description: Gateway operation with opt-in independent OTLP and native ClickHouse completed-span destinations.
+resource: /doc/event-multiplexer/operations.md
+status: maintained
+revised_by: model:openai/gpt-6.1-sol#xhigh
+date: 2026-10-11
+sources:
+  - resource: opencode://ses_ed2d6efafffeJebEhJ6FDRWIeF
+    title: Native telemetry build/configuration/table setup, coexistence and bounded lifecycle additions; existing gateway guidance retained
+  - resource: /telemetry/arrow/README.md
+    title: Versioned collector-compatible table contract and projection losses
+  - resource: /telemetry/clickhouse-native/README.md
+    title: Verified native protocol/acknowledgment and runtime/TLS constraints
+  - resource: /design/event-multiplexer/clickhouse-schema0.glm53fx.md
+    title: Independent ClickStack/HyperDX infrastructure/schema research
+---
+
 # Operating the event gateway
 
 ## Topology
@@ -194,7 +213,10 @@ The additive `otel` feature selects composition only; `otlp` selects its backend
 Without `otlp`, explicit exporter selection or endpoint inference fails startup
 with an actionable rebuild instruction. `OTEL_SDK_DISABLED=true` and
 `OTEL_TRACES_EXPORTER=none` still take precedence. Unknown exporter names fail;
-no ClickHouse exporters or selection extensions are implemented yet.
+`clickhouse-native` is a separate additive backend feature. Select either sink or
+`OTEL_TRACES_EXPORTER=otlp,clickhouse-native`; they use separate bounded processors
+with a shared resource/sampler/filter. `none` mixed with other sinks and duplicate
+destinations are rejected. Native endpoints alone never infer native activation.
 
 Reusable provider/layer policy lives at `telemetry/core/` (`bus-proxy-telemetry`),
 not in gateway/router. Environment and credential resolution, TLS global policy,
@@ -215,7 +237,7 @@ Environment=BUS_PROXY_OTEL_FILTER=info,bus_proxy_gateway=debug,bus_proxy_router=
 
 | Environment | Meaning / default |
 | --- | --- |
-| `OTEL_TRACES_EXPORTER` | `otlp` enables export (default collector `http://localhost:4318`); `none` disables it even with endpoints set. Unset enables only when an endpoint is present. Other values are rejected. |
+| `OTEL_TRACES_EXPORTER` | `otlp`, `clickhouse-native`, or their comma-separated pair. `none` alone disables even with endpoints set. Unset infers **only OTLP** from an OTLP endpoint. Unknown/duplicate/mixed-none values fail. |
 | `OTEL_SDK_DISABLED` | `true` (case-insensitive) disables export regardless of the other settings. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | Collector base URL; the SDK appends `/v1/traces`. HTTP and HTTPS are supported. |
 | `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | Full traces URL, used verbatim; overrides the generic endpoint. |
@@ -229,6 +251,7 @@ Environment=BUS_PROXY_OTEL_FILTER=info,bus_proxy_gateway=debug,bus_proxy_router=
 | `OTEL_BSP_MAX_QUEUE_SIZE` | Bounded completed-span queue (2048). |
 | `OTEL_BSP_MAX_EXPORT_BATCH_SIZE` | Maximum spans per batch (512), capped by queue size. |
 | `BUS_PROXY_OTEL_FILTER` | Export filter using `RUST_LOG` directive syntax (default `info`), independent of local logging. Only proxy-owned tracing targets are exported, preventing exporter feedback loops. |
+| `BUS_PROXY_OTEL_SHUTDOWN_TIMEOUT_MS` | Total graceful SDK drain budget (5000; 1..=300000), divided among selected processors. Native cancellation/join adds its unavoidable upstream connect/cleanup allowance; see below. |
 
 `RUST_LOG` and `--log-json` still control local output. Sampling and export
 filtering do not suppress local logs. Standalone log events outside spans are
@@ -238,14 +261,124 @@ HTTP trace-context extraction or outgoing context injection in this integration.
 Spans export when closed: long-lived subscriptions and the router can remain
 open until disconnect/shutdown. There are no per-frame spans. Export runs on a
 bounded background worker; collector failures do not interrupt gateway traffic.
-Shutdown drains completed spans after gateway/router shutdown, with the SDK's
-bounded shutdown wait (5 seconds). Export is best-effort; queue overflow,
+Shutdown drains completed spans after gateway/router shutdown, with the host's
+bounded graceful wait (5 seconds by default). Export is best-effort; queue overflow,
 collector failure, or a forced kill can lose telemetry.
 
 HTTPS uses platform certificate verification. Custom OTLP certificate/mTLS env
 settings and compression are not configured by this integration. SDK numeric
 and sampling settings follow SDK fallback behavior on invalid values; malformed
 export filters and unsupported exporter/protocol selections fail startup.
+
+## Native ClickHouse trace export
+
+Build with `cargo build --release --locked -p opencode-bus-proxy --features
+clickhouse-native`, or `--features otlp,clickhouse-native` to make both available.
+Local-only and OTLP-only builds compile no Arrow/native dependencies. Runtime
+selection is explicit; a requested but absent backend fails before listening with
+its exact rebuild feature. Disabled/`none` selections do not read native config.
+
+The external **clickhouse-arrow 0.2.1** client takes Arrow 57 RecordBatches but
+sends **native TCP/TLS blocks**, not HTTP ArrowStream. Native configuration has a
+separate namespace: do not reuse an HTTP endpoint or the preserved draft's config.
+Export is completed spans + attached events/links, not standalone logs/live state.
+
+### Explicit table setup and example
+
+Use an existing verified collector/ClickStack trace table, or edit the database /
+table in [`telemetry/arrow/schema/traces-v1.sql`](../../telemetry/arrow/schema/traces-v1.sql)
+and execute it yourself, for example:
+
+```sh
+clickhouse client --host 127.0.0.1 --port 9000 --multiquery < telemetry/arrow/schema/traces-v1.sql
+```
+
+This **example** creates `default.otel_traces`; it is not a deployment decision.
+The DDL has no implicit TTL, migrations or trace-id lookup materialized view.
+Choose table ownership, retention and indexes deliberately. Native insert names
+its 22 columns explicitly, so HyperDX MATERIALIZED extras are not overwritten.
+The [schema contract](../../telemetry/arrow/README.md) describes standard string
+attributes, parallel events/links, nanoseconds, limits and deliberate losses.
+
+Example for a **trusted local plaintext** server (TLS is the default otherwise):
+
+```ini
+Environment=OTEL_TRACES_EXPORTER=clickhouse-native
+Environment=BUS_PROXY_CLICKHOUSE_NATIVE_HOST=127.0.0.1
+Environment=BUS_PROXY_CLICKHOUSE_NATIVE_PORT=9000
+Environment=BUS_PROXY_CLICKHOUSE_NATIVE_TLS=false
+Environment=BUS_PROXY_CLICKHOUSE_NATIVE_DATABASE=default
+Environment=BUS_PROXY_CLICKHOUSE_NATIVE_TABLE=otel_traces
+Environment=BUS_PROXY_CLICKHOUSE_NATIVE_USERNAME=default
+Environment=BUS_PROXY_CLICKHOUSE_NATIVE_CREDENTIAL=clickhouse-password
+LoadCredential=clickhouse-password:/etc/opencode/clickhouse-password
+Environment=OTEL_SERVICE_NAME=opencode-bus-proxy
+```
+
+Library hosts supply typed config/resource/policy themselves. The daemon reads
+environment/files/systemd credentials and selects the global rustls ring provider
+before any TLS construction. It does not require a reachable database for readiness.
+
+All following names have prefix **`BUS_PROXY_CLICKHOUSE_NATIVE_`**:
+
+| Suffix | Meaning / default |
+| --- | --- |
+| `HOST` | **Required** native hostname or IP, not a URL/credentials. Numeric IP avoids residual OS DNS work. |
+| `PORT` | 9440 with TLS, 9000 without; nonzero UInt16. |
+| `TLS` | Strict `true`/`false` (case-insensitive); **true**. |
+| `TLS_SERVER_NAME` | Optional TLS identity override, useful with a numeric host; requires TLS. |
+| `DATABASE` / `TABLE` | Database `default`; **table required**. ASCII identifiers, no leading digit, at most 128 bytes; no arbitrary SQL. |
+| `USERNAME` / `PASSWORD` | User `default`; empty password if none supplied. Secrets are not placed in endpoints or error strings. |
+| `PASSWORD_FILE` / `CREDENTIAL` | File or filename-safe systemd credential (mutually exclusive); overrides password env. Trailing CR/LF removed, other whitespace retained. |
+| `TIMEOUT_MS` | Positive DNS/handshake/insert/full-ack deadline, 10000; max 300000. Fixed upstream blocking-connect allowance is additional. |
+| `MAX_BATCH_ROWS` / `MAX_BATCH_BYTES` | 4096 / 16777216. At most one active and one queued bounded raw batch; SDK trace queue is independently bounded by OTEL_BSP settings. |
+| `MAX_STRING_BYTES` / `MAX_ATTRIBUTES` | 16384 / 1024, per encoded value/string and attribute map. |
+| `MAX_EVENTS` / `MAX_LINKS` / `MAX_ARRAY_ITEMS` | 128 / 128 per span; 1024 per attribute array. |
+| `REDACT_KEYS` | Additional nonempty comma-separated exact case-insensitive attribute keys. Credential-related defaults apply already; not a general PII/content filter. |
+
+Native numeric/boolean/identifier policy is strict; malformed selected config
+fails startup. Oversize projected batches fail whole rather than silently truncate.
+Shared BSP settings still follow SDK fallback behavior; configure SDK span/event
+limits consistently with native projection limits if increasing them.
+
+The daemon rejects upstream `CLICKHOUSE_NATIVE_DEBUG_ARROW`,
+`CONNECTION_READ_BUFFER_SIZE`, and `CONNECTION_WRITE_BUFFER_SIZE` when native is
+selected: they bypass typed policy, and debug Arrow can print batch data. Libraries
+never unset environment silently; embedded hosts must own these upstream ambient
+exceptions. Disabled/`none` export ignores this native-only validation too.
+
+### Acknowledgment and shutdown constraints
+
+Native exports run on a private runtime thread, never gateway/router workers.
+Success requires the **entire native response and a same-connection ping** (the
+audited upstream can otherwise mistake a fatal-I/O channel close for completion).
+No automatic retries: timeout/disconnection can follow a committed insert.
+Failures are sanitized, best-effort batch drops and do not stop gateway traffic.
+Native and OTLP never silently fall back to one another. Selecting both exports
+each sampled span twice to their independent destinations; if a collector also
+writes to the same ClickHouse table, that creates duplicate rows.
+
+Upstream TCP connect is non-preemptible with a fixed **30-second** timeout. Add
+that allowance to operation/cancellation bounds; private-worker isolation protects
+gateway scheduling but cannot erase an upstream blocking call. After the graceful
+SDK drain budget, the host cancels/joins native work rather than detaching inserts:
+shutdown can add **30 seconds plus one second of DNS cleanup**. OS `getaddrinfo`
+may outlive that one-second allowance as a DNS-only task; it cannot resume an
+insert. Use numeric host + TLS name if residual DNS work is unacceptable.
+
+Native TLS supports WebPKI roots only, no custom CA/mTLS configuration. Both
+aws-lc and ring build because of upstream mandatory features; host preselection
+prevents silent TLS policy changes. Wire compression is off: default upstream LZ4
+failed on installed 26.9 insert headers. Verified native/table paths used
+ClickHouse **25.6.13.41 and 26.9.7.9**; latest floating ClickStack images and a
+live HyperDX UI were not tested.
+
+Example query (replace the configured database/table as appropriate):
+
+```sql
+SELECT Timestamp, ServiceName, SpanName, Duration / 1e6 AS DurationMs, StatusCode
+FROM default.otel_traces ORDER BY Timestamp DESC LIMIT 20;
+```
 
 ## Limits and failure behavior
 

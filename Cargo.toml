@@ -1,5 +1,5 @@
 [workspace]
-members = ["components/protocol", "components/router", "components/gateway", "cli/daemon", "telemetry/core", "telemetry/clickhouse-native"]
+members = ["components/protocol", "components/router", "components/gateway", "cli/daemon", "telemetry/core", "telemetry/arrow", "telemetry/clickhouse-native"]
 default-members = ["components/protocol", "components/router", "components/gateway", "cli/daemon"]
 resolver = "2"
 
@@ -13,7 +13,8 @@ bus-proxy-protocol = { path = "components/protocol" }
 bus-proxy-router = { path = "components/router" }
 bus-proxy-gateway = { path = "components/gateway" }
 bus-proxy-telemetry = { path = "telemetry/core", default-features = false }
-bus-proxy-clickhouse-native = { path = "telemetry/clickhouse-native", default-features = false }
+bus-proxy-clickhouse-native = { version = "0.1.0", path = "telemetry/clickhouse-native", default-features = false }
+bus-proxy-export-arrow = { version = "0.1.0", path = "telemetry/arrow", default-features = false }
 arrow-array = { version = "57", default-features = false }
 arrow-schema = { version = "57", default-features = false }
 opentelemetry = { version = "0.33.1", default-features = false, features = ["trace"] }

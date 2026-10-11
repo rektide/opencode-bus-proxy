@@ -104,3 +104,41 @@ fn cancellation_does_not_leave_native_work_running() {
     client.shutdown().unwrap();
     server.join().unwrap();
 }
+
+#[test]
+fn raw_submissions_are_bounded_and_shutdown_cancels_pending_work() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut cfg = config(listener.local_addr().unwrap().port());
+    cfg.operation_timeout = Duration::from_secs(2);
+    let client = BatchClient::new(cfg).unwrap();
+    let (opened, opening) = tokio::sync::oneshot::channel();
+    let server = thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut buf = [0; 512];
+        assert!(socket.read(&mut buf).unwrap() > 0);
+        opened.send(()).unwrap();
+        while socket.read(&mut buf).unwrap() > 0 {}
+    });
+    runtime.block_on(async {
+        let first_client = client.clone();
+        let first = tokio::spawn(async move { first_client.insert(batch()).await });
+        opening.await.unwrap();
+        let second_client = client.clone();
+        let second = tokio::spawn(async move { second_client.insert(batch()).await });
+        tokio::task::yield_now().await;
+        assert!(matches!(client.insert(batch()).await, Err(Error::Busy)));
+        first.abort();
+        second.abort();
+        let _ = first.await;
+        let _ = second.await;
+    });
+    client.shutdown().unwrap();
+    server.join().unwrap();
+}

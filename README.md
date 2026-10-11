@@ -1,3 +1,18 @@
+---
+type: ProjectGuide
+title: OpenCode bus proxy
+description: Rust event gateway with optional caller-owned telemetry and independent OTLP/native ClickHouse export.
+resource: /README.md
+status: maintained
+revised_by: model:openai/gpt-6.1-sol#xhigh
+date: 2026-10-11
+sources:
+  - resource: opencode://ses_ed2d6efafffeJebEhJ6FDRWIeF
+    title: Native telemetry build/layout/navigation additions; preexisting gateway description retained
+  - resource: /telemetry/README.md
+    title: Telemetry packages, consumer isolation and optional features
+---
+
 # OpenCode bus proxy
 
 A standalone Rust gateway that moves OpenCode event selection and fan-out out of
@@ -70,10 +85,15 @@ Default builds are local-only: no OpenTelemetry SDK, OTLP or exporter HTTP clien
 For optional OTLP trace export, build with
 `cargo build --release --locked -p opencode-bus-proxy --features otlp`, then set
 `OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318`.
-`otel` enables reusable composition without an OTLP backend; it does not make
-OTLP available. Requesting OTLP in a build without `otlp` fails with a rebuild
-instruction, unless explicitly disabled. The library lives in the root
-[`telemetry/core`](telemetry/README.md) domain subtree.
+For [native ClickHouse](doc/event-multiplexer/operations.md#native-clickhouse-trace-export),
+build with `--features clickhouse-native` and explicitly configure its native
+host/table and `OTEL_TRACES_EXPORTER=clickhouse-native`. The published
+`clickhouse-arrow` client inserts the collector/HyperDX-compatible trace shape.
+`--features otlp,clickhouse-native` permits independent destinations; runtime
+selection accepts their comma-separated pair. `otel` enables composition only,
+not a vendor backend. Requested unavailable sinks fail with a rebuild instruction,
+unless explicitly disabled. Reusable libraries live under [`telemetry`](telemetry/README.md);
+the raw Arrow/native APIs do not require the daemon or OTel SDK.
 Collector headers, resource attributes, sampling, batching, and independent export
 filtering are described in [OTLP configuration](doc/event-multiplexer/operations.md#otlp-trace-export).
 
@@ -102,6 +122,8 @@ silently losing frames or holding up other clients.
 | `components/gateway`  | Authentication, source lifecycle, HTTP and WebSocket transport              |
 | `cli/daemon`          | CLI, tracing, process supervision and shutdown, systemd integration         |
 | `telemetry/core`      | Caller-owned typed telemetry configuration, layers and provider composition |
+| `telemetry/arrow`     | Versioned collector-compatible Arrow schema; optional completed-span projection |
+| `telemetry/clickhouse-native` | Native bounded batch insertion; optional SDK exporter and isolated export runtime |
 
 Package and Rust API names are unchanged. Older design and verification records
 may retain the former `crates/` coordinates; current source navigation uses the

@@ -1,5 +1,6 @@
 //! Bounded native ClickHouse insertion using published `clickhouse-arrow`.
-//! No environment reads, global TLS/runtime/subscriber setup, or table creation.
+//! No wrapper environment reads, global TLS/runtime/subscriber setup, or table
+//! creation. Audited upstream reads the flags listed below; hosts own that policy.
 //! Native I/O is isolated from the caller's executor on an owned thread.
 
 pub use arrow_array::RecordBatch;
@@ -15,9 +16,19 @@ use std::{
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
+#[cfg(feature = "otel")]
+pub mod otel;
+
 /// Audited upstream 0.2.1 has a non-preemptible 30-second TCP connect call.
 /// An operation/cancellation deadline can overrun by at most this allowance.
 pub const CONNECT_BLOCKING_ALLOWANCE: Duration = Duration::from_secs(30);
+/// Upstream 0.2.1 consults these despite typed client configuration. The debug
+/// flag can print batch values. Wrapper never sets/unsets any environment.
+pub const UPSTREAM_ENVIRONMENT_FLAGS: [&str; 3] = [
+    clickhouse_arrow::DEBUG_ARROW_ENV_VAR,
+    clickhouse_arrow::CONN_READ_BUFFER_ENV_VAR,
+    clickhouse_arrow::CONN_WRITE_BUFFER_ENV_VAR,
+];
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
@@ -37,7 +48,9 @@ pub enum Error {
         "native ClickHouse insert failed or acknowledgment was interrupted (details suppressed); no retry was attempted"
     )]
     Insert,
-    #[error("native ClickHouse server rejected operation (code {0}; details suppressed); no retry was attempted")]
+    #[error(
+        "native ClickHouse server rejected operation (code {0}; details suppressed); no retry was attempted"
+    )]
     Server(i32),
     #[error("native ClickHouse export worker failed")]
     Worker,
@@ -150,7 +163,8 @@ impl Config {
     pub fn validate(&self) -> Result<(), Error> {
         if self.host.is_empty()
             || self.host.contains("://")
-            || self.host.contains(['/', '@'])
+            || self.host.contains(['/', '@', '?', '#'])
+            || (self.host.contains(':') && self.host.parse::<std::net::IpAddr>().is_err())
             || self.host.chars().any(char::is_whitespace)
             || self.port == 0
         {
@@ -160,6 +174,15 @@ impl Config {
         }
         if !self.tls && self.tls_server_name.is_some() {
             return Err(Error::Config("TLS server name requires TLS"));
+        }
+        if self.tls {
+            rustls::pki_types::ServerName::try_from(
+                self.tls_server_name
+                    .as_deref()
+                    .unwrap_or(&self.host)
+                    .to_owned(),
+            )
+            .map_err(|_| Error::Config("invalid TLS server name"))?;
         }
         if self.tls && rustls::crypto::CryptoProvider::get_default().is_none() {
             return Err(Error::Config(
@@ -223,6 +246,7 @@ impl std::fmt::Debug for BatchClient {
     }
 }
 impl BatchClient {
+    /// Construct off async application workers, as with SDK provider lifecycle.
     pub fn new(config: Config) -> Result<Self, Error> {
         config.validate()?;
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -406,5 +430,30 @@ mod tests {
         let client = BatchClient::new(config).unwrap();
         client.shutdown().unwrap();
         client.shutdown().unwrap();
+    }
+
+    #[test]
+    fn native_tls_does_not_choose_global_process_policy() {
+        assert!(rustls::crypto::CryptoProvider::get_default().is_none());
+        let config = Config {
+            host: "example.test".into(),
+            port: 9440,
+            tls: true,
+            tls_server_name: None,
+            username: "default".into(),
+            password: String::new(),
+            table: Table::new("default", "test").unwrap(),
+            operation_timeout: Duration::from_secs(1),
+            max_batch_rows: 1,
+            max_batch_bytes: 1024,
+        };
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("CryptoProvider")
+        );
+        assert!(rustls::crypto::CryptoProvider::get_default().is_none());
     }
 }

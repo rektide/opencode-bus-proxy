@@ -1,5 +1,7 @@
 //! Caller-owned telemetry composition. No global subscriber or provider is installed.
 //! Construct and shut down providers off async workers when using blocking exporters.
+#[cfg(feature = "clickhouse-native")]
+pub use bus_proxy_clickhouse_native as clickhouse_native;
 pub use opentelemetry;
 /// The upstream OTLP builder reads standard OTEL environment variables even when
 /// supplied programmatic settings. Use it in a deliberate host adapter, not as an

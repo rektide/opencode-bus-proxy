@@ -144,7 +144,10 @@ fn exports_real_request_spans_and_flushes_on_sigterm() {
                 .read_to_string(&mut stderr)
                 .unwrap();
             assert!(status.success(), "{status}: {stderr}");
-            assert!(!stderr.contains("OTLP shutdown failed"), "{stderr}");
+            assert!(
+                !stderr.contains("telemetry shutdown incomplete"),
+                "{stderr}"
+            );
             break;
         }
         assert!(Instant::now() < deadline, "daemon shutdown timed out");

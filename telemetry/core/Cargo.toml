@@ -7,6 +7,7 @@ license.workspace = true
 [features]
 default = []
 otlp = ["dep:opentelemetry-otlp"]
+clickhouse-native = ["dep:bus-proxy-clickhouse-native", "bus-proxy-clickhouse-native/otel"]
 
 [dependencies]
 opentelemetry.workspace = true
@@ -15,3 +16,4 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 tracing-opentelemetry.workspace = true
 opentelemetry-otlp = { workspace = true, optional = true, features = ["trace", "http-proto", "http-json", "reqwest-blocking-client"] }
+bus-proxy-clickhouse-native = { workspace = true, optional = true }

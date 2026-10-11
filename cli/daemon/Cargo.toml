@@ -8,10 +8,15 @@ license.workspace = true
 default = []
 otel = ["dep:bus-proxy-telemetry"]
 otlp = ["otel", "bus-proxy-telemetry/otlp", "dep:reqwest"]
+clickhouse-native = ["otel", "bus-proxy-telemetry/clickhouse-native"]
 
 [[test]]
 name = "otlp"
 required-features = ["otlp"]
+
+[[test]]
+name = "clickhouse_native"
+required-features = ["clickhouse-native"]
 
 [dependencies]
 bus-proxy-gateway.workspace = true
