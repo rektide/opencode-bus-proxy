@@ -28,7 +28,94 @@ pub(crate) struct ClientOwner {
     pub socket: TcpStream,
     pub sub: Subscription,
     pub image: ClientImage,
+    output: Output,
     pub _permit: Arc<OwnedSemaphorePermit>,
+}
+
+/// One dequeued shared frame, not a second per-client payload allocation. The
+/// header and trailer are separate immutable segments; the offset is advanced
+/// synchronously with each successful socket write. Flatten only at a cut.
+#[derive(Default)]
+struct Output {
+    parts: [Bytes; 3],
+    offset: usize,
+}
+impl Output {
+    fn wire(bytes: Vec<u8>, offset: u64) -> Self {
+        if offset == bytes.len() as u64 {
+            return Self::default();
+        }
+        Self {
+            parts: [Bytes::from(bytes), Bytes::new(), Bytes::new()],
+            offset: offset as usize,
+        }
+    }
+    fn chunk(frame: Bytes) -> Self {
+        Self {
+            parts: [
+                Bytes::from(format!("{:x}\r\n", frame.len())),
+                frame,
+                Bytes::from_static(b"\r\n"),
+            ],
+            offset: 0,
+        }
+    }
+    fn len(&self) -> usize {
+        self.parts.iter().map(Bytes::len).sum()
+    }
+    fn pending(&self) -> bool {
+        self.offset < self.len()
+    }
+    fn slices(&self) -> [io::IoSlice<'_>; 3] {
+        let mut offset = self.offset;
+        std::array::from_fn(|index| {
+            let part = &self.parts[index];
+            let skip = offset.min(part.len());
+            offset -= skip;
+            io::IoSlice::new(&part[skip..])
+        })
+    }
+    fn advance(&mut self, n: usize) {
+        self.offset += n;
+        if !self.pending() {
+            *self = Self::default();
+        }
+    }
+    fn snapshot(&self) -> (Vec<u8>, u64) {
+        let mut bytes = Vec::with_capacity(self.len());
+        for part in &self.parts {
+            bytes.extend_from_slice(part);
+        }
+        (bytes, self.offset as u64)
+    }
+}
+impl ClientOwner {
+    pub(crate) fn new(
+        socket: TcpStream,
+        sub: Subscription,
+        mut image: ClientImage,
+        permit: Arc<OwnedSemaphorePermit>,
+    ) -> Self {
+        let output = Output::wire(
+            std::mem::take(&mut image.output),
+            std::mem::take(&mut image.offset),
+        );
+        Self {
+            socket,
+            sub,
+            image,
+            output,
+            _permit: permit,
+        }
+    }
+    pub(crate) fn output_len(&self) -> usize {
+        self.output.len()
+    }
+    pub(crate) fn snapshot(&self) -> ClientImage {
+        let mut image = self.image.clone();
+        (image.output, image.offset) = self.output.snapshot();
+        image
+    }
 }
 
 pub(crate) struct SourceOwner {
@@ -179,16 +266,7 @@ pub(crate) async fn accepted(
         offset: 0,
         read_eof: false,
     };
-    client(
-        ClientOwner {
-            socket,
-            sub,
-            image,
-            _permit: permit,
-        },
-        state,
-    )
-    .await
+    client(ClientOwner::new(socket, sub, image, permit), state).await
 }
 
 pub(crate) async fn client(mut owner: ClientOwner, state: Arc<State>) -> Option<ClientOwner> {
@@ -205,13 +283,12 @@ pub(crate) async fn client(mut owner: ClientOwner, state: Arc<State>) -> Option<
             _ = state.pause.cancelled() => return Some(owner),
             _ = state.shutdown.cancelled() => return None,
             _ = retired.cancelled() => return None,
-            ready = owner.socket.writable(), if owner.image.offset < owner.image.output.len() as u64 => {
+            ready = owner.socket.writable(), if owner.output.pending() => {
                 if ready.is_err() { return None; }
-                match owner.socket.try_write(&owner.image.output[owner.image.offset as usize..]) {
+                match owner.socket.try_write_vectored(&owner.output.slices()) {
                     Ok(0) => return None,
                     Ok(n) => {
-                        owner.image.offset += n as u64;
-                        if owner.image.offset == owner.image.output.len() as u64 { owner.image.output.clear(); owner.image.offset = 0; }
+                        owner.output.advance(n);
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {},
                     Err(_) => return None,
@@ -227,11 +304,11 @@ pub(crate) async fn client(mut owner: ClientOwner, state: Arc<State>) -> Option<
                     Err(_) => return None,
                 }
             }
-            frame = owner.sub.recv(), if owner.image.output.is_empty() => {
-                owner.image.output = encode_chunk(&frame?);
+            frame = owner.sub.recv(), if !owner.output.pending() => {
+                owner.output = Output::chunk(frame?);
             }
-            _ = heartbeat.tick(), if owner.image.output.is_empty() => {
-                owner.image.output = encode_chunk(b": heartbeat\n\n");
+            _ = heartbeat.tick(), if !owner.output.pending() => {
+                owner.output = Output::chunk(Bytes::from_static(b": heartbeat\n\n"));
             }
         }
     }
@@ -242,13 +319,6 @@ impl Drop for Registration {
     fn drop(&mut self) {
         self.0.remove(&self.1);
     }
-}
-
-pub(crate) fn encode_chunk(bytes: &[u8]) -> Vec<u8> {
-    let mut output = format!("{:x}\r\n", bytes.len()).into_bytes();
-    output.extend_from_slice(bytes);
-    output.extend_from_slice(b"\r\n");
-    output
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -657,6 +727,30 @@ pub(crate) async fn source(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chunk_output_shares_payload_and_restores_every_segment_offset() {
+        let frame = Bytes::from(vec![b'x'; 100]);
+        let wire = Output::chunk(frame.clone()).snapshot().0;
+        let owner = Output::chunk(frame.clone());
+        assert_eq!(
+            owner.parts[1].as_ptr(),
+            frame.as_ptr(),
+            "no per-client payload copy"
+        );
+        for cut in 0..wire.len() {
+            let mut old = Output::chunk(frame.clone());
+            old.advance(cut);
+            let (snapshot, offset) = old.snapshot();
+            let restored = Output::wire(snapshot, offset);
+            let remaining: Vec<_> = restored
+                .slices()
+                .iter()
+                .flat_map(|s| s.iter().copied())
+                .collect();
+            assert_eq!(remaining, wire[cut..], "cut {cut}");
+        }
+    }
 
     fn drain(framing: &mut Framing, buffer: &mut Vec<u8>, output: &mut Vec<u8>) {
         loop {

@@ -443,12 +443,7 @@ pub(crate) async fn run(
                     .expect("validated inherited connection cap"),
             );
             connections.spawn(transport::client(
-                ClientOwner {
-                    socket,
-                    image,
-                    sub,
-                    _permit: permit,
-                },
+                ClientOwner::new(socket, sub, image, permit),
                 state.clone(),
             ));
         }
@@ -486,7 +481,7 @@ pub(crate) async fn run(
                     weight = weight.saturating_add(source.image.epoch.as_ref().map_or(0, |e| e.len().saturating_mul(6)));
                     for client in &parked {
                         weight = weight.saturating_add(2048)
-                            .saturating_add(client.image.output.len().saturating_mul(2))
+                            .saturating_add(client.output_len().saturating_mul(2))
                             .saturating_add(client.image.key.len().saturating_mul(6))
                             .saturating_add(client.image.subscription.len().saturating_mul(6));
                     }
@@ -507,7 +502,7 @@ pub(crate) async fn run(
                         }
                         let image = Image { version: FORMAT_VERSION, generation, boot_id: boot_id().map_err(GatewayError::Listener)?, cut_ms: monotonic_ms(),
                             compatibility: compatibility(&state.config), listener_address: listener.local_addr().map_err(GatewayError::Listener)?, sockets,
-                            source: source_owner.image.clone(), clients: parked.iter().map(|c| c.image.clone()).collect(), router: router_image,
+                            source: source_owner.image.clone(), clients: parked.iter().map(ClientOwner::snapshot).collect(), router: router_image,
                             metrics: [state.metrics.frames.load(Ordering::Relaxed), state.metrics.bytes.load(Ordering::Relaxed), state.metrics.failures.load(Ordering::Relaxed)] };
                          Parked { listener, source: source_owner, clients: parked, image: Arc::new(image) }
                     }
