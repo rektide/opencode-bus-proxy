@@ -344,6 +344,25 @@ async fn stomp_preserves_another_known_proxy_endpoint_instead_of_becoming_a_noop
 }
 
 #[tokio::test]
+async fn compatible_edits_and_partial_save_recovery_keep_our_token_reconcilable() {
+    let mut fixture = Fixture::new().await;
+    fixture.write(&fixture.origin());
+    fixture.registration.reconcile().await.unwrap();
+    let mut edited = fixture.read();
+    edited["futureAddition"] = serde_json::json!({"keep":"new"});
+    std::fs::write(&fixture.registration.file, b"{partial").unwrap();
+    assert!(fixture.registration.reconcile().await.is_err());
+    fixture.write(&edited);
+    fixture.registration.reconcile().await.unwrap();
+    assert!(fixture.registration.owned.is_some());
+    assert_eq!(fixture.read()["futureAddition"], edited["futureAddition"]);
+    fixture.registration.restore().unwrap();
+    let mut restored = fixture.origin();
+    restored["futureAddition"] = edited["futureAddition"].clone();
+    assert_eq!(fixture.read(), restored);
+}
+
+#[tokio::test]
 async fn origin_restart_reapplies_url_and_restores_latest_identity() {
     let mut fixture = Fixture::new().await;
     fixture.write(&fixture.origin());

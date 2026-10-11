@@ -258,22 +258,25 @@ impl Registration {
             return Ok(());
         }
         if let Some(marker) = &record.contribution {
+            let ours = marker.pid == self.pid && marker.token == self.token;
             if marker.format != 1
                 || marker.pid == 0
                 || marker.token.is_empty()
                 || !matches!(marker.proxy_endpoint.as_str(), "proxy" | "busProxy")
-                || process_alive(marker.pid)
-                || origin_url(&record.url).ok().as_ref() != Some(&self.advertised)
+                || (!ours && process_alive(marker.pid))
+                || (!ours && origin_url(&record.url).ok().as_ref() != Some(&self.advertised))
             {
                 return Ok(());
             }
-            // Recovery from SIGKILL/crash: only a dead contributor for this
-            // listener and configured origin can be reclaimed.
-            record.url = marker
-                .previous_url
-                .as_ref()
-                .unwrap_or(&marker.origin_url)
-                .clone();
+            // Recover our token after a compatible edit or transient partial
+            // save too. A foreign live contributor remains ineligible.
+            if !ours || origin_url(&record.url).ok().as_ref() == Some(&self.advertised) {
+                record.url = marker
+                    .previous_url
+                    .as_ref()
+                    .unwrap_or(&marker.origin_url)
+                    .clone();
+            }
             recover_metadata(&mut record.extra, marker);
             record.contribution = None;
         }
