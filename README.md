@@ -1,3 +1,16 @@
+---
+type: Guide
+title: OpenCode bus proxy
+description: Subscription-aware gateway overview, operation and implementation layout.
+resource: https://github.com/rektide/opencode-bus-proxy/blob/main/README.md
+status: maintained
+generated: { by: "model:openai/gpt-6.1-sol#medium", at: 2026-10-12 }
+sources:
+  - { resource: "opencode://ses_ed04fa2e4ffe2pYU135EWTc730", title: Extract concrete service-manager and discovery boundaries while preserving daemon lifecycle }
+  - { resource: "crates/daemon/src/main.rs", title: Daemon composition }
+  - { resource: "doc/event-multiplexer/operations.md", title: Operational behavior and discovery ownership }
+---
+
 # OpenCode bus proxy
 
 A standalone Rust gateway that moves OpenCode event selection and fan-out out of
@@ -93,7 +106,16 @@ silently losing frames or holding up other clients.
 | `crates/protocol` | Ordinary scoped events, shared selection contract, control and SSE decoding |
 | `crates/router`   | Session index, atomic interest replacement, bounded queues, epochs          |
 | `crates/gateway`  | Authentication, source lifecycle, HTTP and WebSocket transport              |
-| `crates/daemon`   | CLI, tracing, process supervision and shutdown, systemd integration        |
+| `crates/service-manager` | Bind/adopt/store-once listener policy, systemd notifications and owned watchdog |
+| `crates/discovery` | Optional native discovery contribution/restoration and owned Effect watcher |
+| `crates/daemon`   | CLI/credentials, tracing, application composition, supervision and bounded shutdown |
+
+[`main.rs`](crates/daemon/src/main.rs) follows startup order: resolve configuration
+and credentials, capture manager state before serving-runtime threads start,
+acquire a listener, prepare discovery ownership, start router/gateway, start
+integrations, then supervise. [`configuration.rs`](crates/daemon/src/configuration.rs)
+owns CLI policy; [`supervision.rs`](crates/daemon/src/supervision.rs) owns exit
+classification and shutdown grace. Gateway and router have no systemd dependency.
 
 ```sh
 cargo test --workspace --locked

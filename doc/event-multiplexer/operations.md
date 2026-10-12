@@ -4,8 +4,10 @@ title: Operating the event gateway
 description: Gateway topology, native discovery contribution, credentials, lifecycle, bounds and diagnostics.
 resource: https://github.com/rektide/opencode-bus-proxy/blob/main/doc/event-multiplexer/operations.md
 status: maintained
-generated: { by: "human:rektide + model:openai/gpt-6.1-sol", at: 2026-10-11 }
+generated: { by: "human:rektide + model:openai/gpt-6.1-sol#medium", at: 2026-10-12 }
 sources:
+  - { resource: "opencode://ses_ed04fa2e4ffe2pYU135EWTc730", title: Document daemon integration ownership after service-manager and discovery extraction }
+  - { resource: "file:///home/rektide/src/opencode-bus-proxy/crates/discovery/src/lib.rs", title: Current native contribution and watcher lifetime owner }
   - { resource: "urn:opencode:session:ses_ed3ebd410ffehOKUhZcNU2hHYk", title: Native discovery, enrichment, stomp and watcher direction }
   - { resource: "file:///home/rektide/src/opencode-bus-proxy/crates/daemon/src/registration.rs", title: Daemon contribution implementation, 6a9358cb and f232d0da }
   - { resource: "file:///home/rektide/src/opencode-working/packages/util/src/filesystem-watch-client.ts", title: Reused Effect watcher process owner }
@@ -15,6 +17,14 @@ sources:
 # Operating the event gateway
 
 ## Topology
+
+Implementation ownership is described in the
+[crate map](../../README.md#layout-and-verification) and
+[gateway architecture](../../design/event-multiplexer/architecture.md#crate-boundaries).
+Concrete systemd listener/notification policy lives in `crates/service-manager`;
+native contribution/restoration and the Effect watcher live in `crates/discovery`.
+Daemon configuration and supervision compose them without changing the CLI or
+the address conflict rules below.
 
 Run one proxy against one bus-smart origin whose ordinary `GET /api/event`
 advertises `OpenCode-Event-Scope: 1`. The upstream URL is an HTTP(S)
