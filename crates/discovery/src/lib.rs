@@ -178,6 +178,8 @@ impl Registration {
 
     pub async fn run(mut self, shutdown: CancellationToken, watcher: Option<watch::Options>) {
         let (events, mut changes) = tokio::sync::mpsc::channel(8);
+        // Normal cancellation awaits helper cleanup below. If this contribution
+        // is aborted or panics, do not detach its watcher (and kill-on-drop child).
         let watching = watcher.map(|options| {
             tokio_util::task::AbortOnDropHandle::new(tokio::spawn(watch::supervise(
                 options,

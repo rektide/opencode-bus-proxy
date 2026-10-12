@@ -20,18 +20,21 @@ pub struct Manager {
 }
 
 impl Manager {
-    /// Must be called before any threads are started.
+    /// Must be called while no other threads are running. Rejects an explicit
+    /// address override before taking descriptor ownership, preserving startup
+    /// error precedence even when the handover descriptor is invalid.
     ///
     /// # Safety
     /// No other thread may read or write process environment while this consumes
     /// LISTEN_PID/LISTEN_FDS/LISTEN_FDNAMES. Descriptor 3 must be owned exclusively
     /// by this activation handover when the environment requests activation.
-    pub unsafe fn capture() -> Result<Self> {
+    pub unsafe fn capture(listen: Option<SocketAddr>) -> Result<Self> {
         let activation = systemd::requested(
             std::env::var("LISTEN_PID").ok().as_deref(),
             std::env::var("LISTEN_FDS").ok().as_deref(),
             std::process::id(),
         )?;
+        reject_activation_override(activation, listen)?;
         let inherited = if activation {
             let descriptor = systemd::activated_fd()?;
             // SAFETY: guaranteed by this function's caller.
@@ -56,15 +59,7 @@ impl Manager {
     /// Adopt exactly one handed-over socket, or bind and offer it to fdstore.
     /// A handed-over socket is already retained: never store it a second time.
     pub async fn acquire_listener(&mut self, listen: Option<SocketAddr>) -> Result<TcpListener> {
-        if self.inherited.is_some()
-            && let Some(address) = listen
-        {
-            return Err(format!(
-                "--listen {address} conflicts with systemd socket activation; \
-                 the socket unit's ListenStream= owns the bind address"
-            )
-            .into());
-        }
+        reject_activation_override(self.inherited.is_some(), listen)?;
         if let Some(descriptor) = self.inherited.take() {
             let (listener, address) = systemd::adopt(descriptor)?;
             tracing::info!(%address, "listener adopted from systemd socket activation");
@@ -112,6 +107,17 @@ impl Manager {
     pub fn stopping(&self) {
         let _ = systemd::notify(self.notify_socket.as_deref(), "STOPPING=1");
     }
+}
+
+fn reject_activation_override(activation: bool, listen: Option<SocketAddr>) -> Result<()> {
+    if activation && let Some(address) = listen {
+        return Err(format!(
+            "--listen {address} conflicts with systemd socket activation; \
+             the socket unit's ListenStream= owns the bind address"
+        )
+        .into());
+    }
+    Ok(())
 }
 
 /// Dropping the host's guard stops even a heartbeat whose shutdown is interrupted.
@@ -182,5 +188,46 @@ mod tests {
                 .contains("conflicts with systemd socket activation")
         );
         assert!(manager.inherited.is_some());
+    }
+
+    #[tokio::test]
+    async fn fdstore_failure_does_not_fail_a_self_bound_listener() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut manager = manager(Some(directory.path().join("absent").into_os_string()), None);
+        let listener = manager
+            .acquire_listener(Some("127.0.0.1:0".parse().unwrap()))
+            .await
+            .unwrap();
+        assert_ne!(listener.local_addr().unwrap().port(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn readiness_and_stopping_are_reported_and_heartbeat_has_a_scoped_owner() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("notify");
+        let receiver = UnixDatagram::bind(&path).unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        let mut manager = manager(Some(path.into_os_string()), None);
+        manager.watchdog_interval = Some(Duration::from_secs(5));
+        let heartbeat = manager.ready("127.0.0.1:4097".parse().unwrap(), CancellationToken::new());
+        let mut buffer = [0; 256];
+        let read = receiver.recv(&mut buffer).unwrap();
+        assert_eq!(
+            &buffer[..read],
+            b"READY=1\nSTATUS=event gateway on 127.0.0.1:4097"
+        );
+        tokio::task::yield_now().await;
+        let read = receiver.recv(&mut buffer).unwrap();
+        assert_eq!(&buffer[..read], b"WATCHDOG=1");
+        manager.stopping();
+        let read = receiver.recv(&mut buffer).unwrap();
+        assert_eq!(&buffer[..read], b"STOPPING=1");
+        drop(heartbeat);
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert_eq!(
+            receiver.recv(&mut buffer).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
     }
 }

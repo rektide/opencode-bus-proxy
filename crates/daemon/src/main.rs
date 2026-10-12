@@ -21,7 +21,7 @@ fn main() -> Result<()> {
         .block_on(args.resolve())?;
     // SAFETY: no runtime or application threads are alive; descriptor 3 is the
     // service manager's exclusive handover when LISTEN_PID matches this process.
-    let manager = unsafe { Manager::capture()? };
+    let manager = unsafe { Manager::capture(config.listen)? };
     tokio::runtime::Runtime::new()?.block_on(run(config, manager))
 }
 
