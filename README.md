@@ -133,12 +133,12 @@ silently losing frames or holding up other clients.
 
 | Crate                 | Owns                                                                        |
 | --------------------- | --------------------------------------------------------------------------- |
-| `components/protocol` | Ordinary scoped events, shared selection contract, control and SSE decoding |
-| `components/router`   | Session index, atomic interest replacement, bounded queues, epochs          |
-| `components/gateway`  | Authentication, source lifecycle, HTTP and WebSocket transport              |
-| `components/service-manager` | Standalone listener/notification policy extraction; daemon adoption pending |
-| `components/discovery` | Optional native discovery contribution/restoration and owned Effect watcher |
-| `cli/daemon`          | CLI, tracing, process supervision and shutdown, systemd integration         |
+| `core/protocol` | Ordinary scoped events, shared selection contract, control and SSE decoding |
+| `core/router`   | Session index, atomic interest replacement, bounded queues, epochs          |
+| `core/gateway`  | Authentication, source lifecycle, HTTP and WebSocket transport              |
+| `integrations/service-manager` | Standalone listener/notification policy extraction; daemon adoption pending |
+| `integrations/discovery` | Optional native discovery contribution/restoration and owned Effect watcher |
+| `daemon`          | CLI, tracing, process supervision and shutdown, systemd integration         |
 | `telemetry/core`      | Caller-owned typed telemetry configuration, layers and provider composition |
 | `telemetry/arrow`     | Versioned collector-compatible Arrow schema; optional completed-span projection |
 | `telemetry/clickhouse-native` | Native bounded batch insertion; optional SDK exporter and isolated export runtime |
@@ -147,7 +147,7 @@ Package and Rust API names are unchanged. Older design and verification records
 may retain the former `crates/` coordinates; current source navigation uses the
 paths above. The six core packages remain the default workspace members;
 telemetry is selected explicitly by package or daemon feature. In
-[`main.rs`](cli/daemon/src/main.rs) the daemon resolves configuration and
+[`main.rs`](daemon/src/main.rs) the daemon resolves configuration and
 credentials, captures activation before serving tasks start, acquires a
 listener, prepares discovery ownership, starts router/gateway/registration,
 then supervises a bounded shutdown. Gateway and router have no systemd

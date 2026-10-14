@@ -31,7 +31,7 @@ Implementation ownership is described in the
 [crate map](../../README.md#layout-and-verification) and
 [gateway architecture](../../design/event-multiplexer/architecture.md#crate-boundaries).
 Native contribution/restoration and the Effect watcher live in
-`components/discovery`. `components/service-manager` is a standalone
+`integrations/discovery`. `integrations/service-manager` is a standalone
 listener/notification policy extraction whose adoption by the daemon is pending;
 the daemon still owns its activation, fdstore, watchdog and handover policy
 inline, including named-descriptor activation.
@@ -608,7 +608,7 @@ configuration. It starts no managed service and executes no model calls. Set
 and Rust copies of `event-scope-v1.json` are identical, and that ordinary clients
 and updated native decoders handle scoped events through the same routes.
 
-The router's release benchmark is in `components/router/examples/routing_bench.rs`:
+The router's release benchmark is in `core/router/examples/routing_bench.rs`:
 
 ```sh
 cargo run --release --locked -p bus-proxy-router --example routing_bench -- 128 20000 512

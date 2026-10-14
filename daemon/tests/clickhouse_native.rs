@@ -1,4 +1,4 @@
-#[path = "../../../test/support/clickhouse.rs"]
+#[path = "../../test/support/clickhouse.rs"]
 mod clickhouse;
 use std::{
     io::{Read, Write},
@@ -119,9 +119,7 @@ fn selected_native_rejects_upstream_ambient_flags_and_disable_wins() {
 #[ignore = "starts an isolated disposable installed ClickHouse server"]
 fn native_daemon_flushes_real_request_spans_with_otlp_available() {
     let server = clickhouse::Server::start();
-    server.query(include_str!(
-        "../../../telemetry/arrow/schema/traces-v1.sql"
-    ));
+    server.query(include_str!("../../telemetry/arrow/schema/traces-v1.sql"));
     server.query(
         "ALTER TABLE otel_traces ADD COLUMN materialized_service String MATERIALIZED ServiceName",
     );

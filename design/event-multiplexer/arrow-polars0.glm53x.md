@@ -27,7 +27,7 @@ sources:
     title: Operator-owned DDL example, no TTL
   - resource: /telemetry/arrow/tests/projection.rs
     title: Projection fixture coverage shape
-  - resource: /components/router/examples/state_exports.rs
+  - resource: /core/router/examples/state_exports.rs
     title: Observational Inspection envelope, reactive View, declared-field tracing test
   - resource: /design/event-multiplexer/examples/arrow_exports.py
     title: Offline Polars adapter — explicit schemas, IPC file+stream, scan_ipc round-trip, manifest
@@ -37,15 +37,15 @@ sources:
     title: rkyv image codec experiment (handover-owned, not Arrow prerequisite)
   - resource: /doc/event-multiplexer/operations.md
     title: Bounded-memory limits and failure behavior; OTLP/native export operation; /_bus diagnostics surface
-  - resource: /cli/daemon/Cargo.toml
+  - resource: /daemon/Cargo.toml
     title: Feature-gating precedent — default=[], otel/otlp/clickhouse-native, required-features tests
-  - resource: /cli/daemon/tests/telemetry_availability.rs
+  - resource: /daemon/tests/telemetry_availability.rs
     title: Actionable rebuild-instruction failure tests
-  - resource: /cli/daemon/src/telemetry.rs
+  - resource: /daemon/src/telemetry.rs
     title: Destination selection/require(), shutdown budget division
   - resource: /Cargo.toml
     title: Workspace members/default-members; arrow-array/arrow-schema 57 pins (read at main)
-  - resource: /components/router/src/lib.rs
+  - resource: /core/router/src/lib.rs
     title: Snapshot/SubscriptionInfo fields; "IDs/session names are never labels"; RouterImage freeze note
   - resource: file:///home/rektide/src/occhre/crates/interchange/arrow/Cargo.toml
     title: arrow 60 ipc-only pin; cross-major IPC seam; dev-dep arrow-v58 counterparty
@@ -76,9 +76,9 @@ inventories the parked prototype in this repository, reads what occhre actually
 does with polars/arrow, and reconciles both against the recorded export-surface
 ruling and the bounded-memory discipline. One structural fact first: the
 telemetry-era layout lives on the `main` bookmark (`txoqoyzp`) —
-`components/{protocol,router,gateway}`, `cli/daemon`,
-`telemetry/{core,arrow,clickhouse-native}` — while the current working copy is
-a conflicted merge in progress between that line and the `crates/`-layout
+`core/{protocol,router,gateway}`, `daemon`,
+`telemetry/{core,arrow,clickhouse-native}` — while at writing time the working
+copy was a conflicted merge in progress between that line and the `crates/`-layout
 native-discovery line (working-copy parents `txoqoyzp` and `tzstullv`). Path
 references below are main-relative; landing happens after that merge resolves.
 
@@ -99,7 +99,7 @@ handled below.
 
 Three distinct artifacts, none of them production code:
 
-1. **`components/router/examples/state_exports.rs`** — the observational
+1. **`core/router/examples/state_exports.rs`** — the observational
    inspection prototype. `Inspection { schema_version: 1, revision, consistency:
    "observational", subscriptions, memberships, router: Snapshot }` with
    `SubscriptionRow` (id/mode/active/interest_count/backlog_frames/backlog_bytes)
@@ -267,10 +267,10 @@ conflated:
   advertises availability exactly like OTLP/native.
 
 **Build gating.** Follow the established precedent exactly: daemon
-`default = []` with additive features (`cli/daemon/Cargo.toml`:
+`default = []` with additive features (`daemon/Cargo.toml`:
 `otel`/`otlp`/`clickhouse-native`), `[[test]] required-features`,
 availability tests asserting actionable rebuild strings
-(`cli/daemon/tests/telemetry_availability.rs` checks stderr contains
+(`daemon/tests/telemetry_availability.rs` checks stderr contains
 `--features otlp` / `--features clickhouse-native`), workspace
 `default-members` limited to core packages, and the `cargo tree` isolation
 assertion (telemetry/README.md: local-only daemon must contain no
@@ -363,7 +363,7 @@ telemetry/arrow (bus-proxy-export-arrow)
     src/inspection.rs  — Snapshot → {subscriptions,memberships,...} batches
                          under inspection Policy; schema id in metadata
     src/ipc.rs         — bounded StreamWriter encode (via `ipc` feature)
-cli/daemon
+daemon
   features: inspections = ["bus-proxy-export-arrow/router-state",
                            "bus-proxy-export-arrow/ipc"]
   route: GET /_bus/inspections/<table>.arrows  (authenticated, additive)
@@ -392,9 +392,10 @@ First incremental slice, in order:
 - **Reading "Polars" as a mandate for in-daemon Rust polars** — the largest
   risk; it would break bounded-memory accounting, double the Arrow lineage,
   and contradict both occhre's practice and this repo's recorded ruling.
-- **Layout fork**: the merge in progress must settle `components/`+`cli/`
-  versus `crates/` before any of this lands; recommendations are
-  main-relative.
+- **Layout fork**: resolved after writing — the merge landed as
+  `core/{protocol,router,gateway}`, `daemon/`, `telemetry/*`,
+  `integrations/{discovery,service-manager}`; paths in this document were
+  updated to match.
 - **Inspection-scope creep**: sequenced reactive exports and frozen-image
   exports are deliberately *not* in this slice; conflating consistency
   classes (observational / sequenced / frozen, per state-exports and the

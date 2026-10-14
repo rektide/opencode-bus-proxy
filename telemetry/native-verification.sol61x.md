@@ -37,7 +37,7 @@ router-state projection, or other telemetry signal was added.
 - `telemetry/core`: optional additive native feature/reexport and caller-owned
   shared provider policy with independent processors. No global subscriber,
   TLS setup or environment mutation.
-- `cli/daemon`: additive **clickhouse-native** build feature; runtime
+- `daemon`: additive **clickhouse-native** build feature; runtime
   `OTEL_TRACES_EXPORTER=otlp,clickhouse-native` (or either, or none). Host resolves
   native env/files/systemd secrets, supplies resource/sampling/filter/batches,
   selects TLS provider, installs subscriber, and cancels/joins native work after

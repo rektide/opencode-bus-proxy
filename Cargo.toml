@@ -1,6 +1,6 @@
 [workspace]
-members = ["components/protocol", "components/router", "components/gateway", "components/service-manager", "components/discovery", "cli/daemon", "telemetry/core", "telemetry/arrow", "telemetry/clickhouse-native"]
-default-members = ["components/protocol", "components/router", "components/gateway", "components/service-manager", "components/discovery", "cli/daemon"]
+members = ["core/protocol", "core/router", "core/gateway", "integrations/service-manager", "integrations/discovery", "daemon", "telemetry/core", "telemetry/arrow", "telemetry/clickhouse-native"]
+default-members = ["core/protocol", "core/router", "core/gateway", "integrations/service-manager", "integrations/discovery", "daemon"]
 resolver = "2"
 
 [workspace.package]
@@ -9,10 +9,10 @@ edition = "2024"
 license = "MIT"
 
 [workspace.dependencies]
-bus-proxy-protocol = { path = "components/protocol" }
-bus-proxy-router = { path = "components/router" }
-bus-proxy-gateway = { path = "components/gateway" }
-bus-proxy-discovery = { path = "components/discovery" }
+bus-proxy-protocol = { path = "core/protocol" }
+bus-proxy-router = { path = "core/router" }
+bus-proxy-gateway = { path = "core/gateway" }
+bus-proxy-discovery = { path = "integrations/discovery" }
 bus-proxy-telemetry = { path = "telemetry/core", default-features = false }
 bus-proxy-clickhouse-native = { version = "0.1.0", path = "telemetry/clickhouse-native", default-features = false }
 bus-proxy-export-arrow = { version = "0.1.0", path = "telemetry/arrow", default-features = false }

@@ -40,7 +40,7 @@ const contractText = await Bun.file(
   resolve(root, "../opencode-bus-smart/packages/protocol/fixtures/event-scope-v1.json"),
 ).text()
 assert.equal(
-  await Bun.file(resolve(root, "components/protocol/fixtures/event-scope-v1.json")).text(),
+  await Bun.file(resolve(root, "core/protocol/fixtures/event-scope-v1.json")).text(),
   contractText,
   "native and Rust delivery fixtures must be byte-identical",
 )
