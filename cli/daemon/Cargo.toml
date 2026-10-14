@@ -21,6 +21,7 @@ required-features = ["clickhouse-native"]
 [dependencies]
 bus-proxy-gateway.workspace = true
 bus-proxy-router.workspace = true
+bus-proxy-discovery.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true

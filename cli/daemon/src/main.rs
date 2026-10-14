@@ -7,6 +7,7 @@ use std::{
     time::Duration,
 };
 
+use bus_proxy_discovery as registration;
 use bus_proxy_gateway::Config;
 use bus_proxy_router::{Limits, Router};
 use clap::Parser;
@@ -46,6 +47,39 @@ struct Arguments {
     /// Shared origin password systemd credential name, read from $CREDENTIALS_DIRECTORY.
     #[arg(long, env = "BUS_PROXY_CREDENTIAL")]
     credential: Option<String>,
+
+    /// Contribute the gateway URL to this existing operator-owned OpenCode record.
+    #[arg(long, env = "BUS_PROXY_SERVICE_FILE")]
+    service_file: Option<PathBuf>,
+
+    /// Advertised local URL; defaults to the actual listener with wildcard mapped to loopback.
+    #[arg(long, env = "BUS_PROXY_SERVICE_URL", requires = "service_file")]
+    service_url: Option<String>,
+
+    /// Cooperate supplements endpoints; stomp also reapplies this gateway's contact URL.
+    #[arg(
+        long,
+        env = "BUS_PROXY_SERVICE_MODE",
+        value_enum,
+        default_value = "cooperate"
+    )]
+    service_mode: registration::Mode,
+
+    /// Include public service/proxy endpoint descriptions (no additional secrets).
+    #[arg(long, env = "BUS_PROXY_SERVICE_METADATA", default_value_t = true, action = clap::ArgAction::Set)]
+    service_metadata: bool,
+
+    /// Bun invalidation helper reusing the existing Effect watcher (optional).
+    #[arg(long, env = "BUS_PROXY_SERVICE_WATCH_HELPER", requires_all = ["service_file", "service_watch_source"])]
+    service_watch_helper: Option<PathBuf>,
+
+    /// OpenCode source root containing effect-watch's util modules.
+    #[arg(
+        long,
+        env = "BUS_PROXY_SERVICE_WATCH_SOURCE",
+        requires = "service_watch_helper"
+    )]
+    service_watch_source: Option<PathBuf>,
 
     /// Explicitly allow an origin and gateway without authentication.
     #[arg(long)]
@@ -153,8 +187,7 @@ fn frame_target(value: &str) -> std::result::Result<usize, String> {
         .map_err(|_| "expected an integer from 0 to 4294967295".into())
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let args = Arguments::parse();
     if let Some(version) = args.check_handover_format {
         if version != bus_proxy_gateway::handover::FORMAT_VERSION {
@@ -163,6 +196,10 @@ async fn main() -> Result<()> {
         println!("OBP handover format {version}");
         return Ok(());
     }
+    // Capture activation before the async runtime exists. A dead inherited
+    // descriptor must fail validation here and now: runtime-owned descriptors
+    // (epoll, eventfd) could otherwise silently claim fd 3 and be stolen as
+    // the listener, aborting later through I/O-safety double-close detection.
     let activation = systemd::requested(
         std::env::var("LISTEN_PID").ok().as_deref(),
         std::env::var("LISTEN_FDS").ok().as_deref(),
@@ -179,11 +216,13 @@ async fn main() -> Result<()> {
     // TLS process policy belongs to the host, independent of telemetry activation.
     let _ = rustls::crypto::ring::default_provider().install_default();
     let json = args.log_json;
-    let telemetry = tokio::task::spawn_blocking(move || telemetry::init(json)).await??;
-    let result = run(args, descriptors).await;
-    // The batch worker uses blocking HTTP; flush outside Tokio's worker threads.
-    tokio::task::spawn_blocking(move || telemetry.shutdown()).await?;
-    result
+    tokio::runtime::Runtime::new()?.block_on(async move {
+        let telemetry = tokio::task::spawn_blocking(move || telemetry::init(json)).await??;
+        let result = run(args, descriptors).await;
+        // The batch worker uses blocking HTTP; flush outside Tokio's worker threads.
+        tokio::task::spawn_blocking(move || telemetry.shutdown()).await?;
+        result
+    })
 }
 
 async fn run(args: Arguments, mut descriptors: HashMap<String, OwnedFd>) -> Result<()> {
@@ -300,6 +339,30 @@ async fn run(args: Arguments, mut descriptors: HashMap<String, OwnedFd>) -> Resu
         listener
     };
     let address = listener.local_addr()?;
+    // Validate and acquire discovery's ownership lock before starting serving.
+    let watcher = args
+        .service_watch_helper
+        .zip(args.service_watch_source)
+        .map(|(helper, source)| registration::watch::Options { helper, source });
+    let registration = args
+        .service_file
+        .as_ref()
+        .map(|file| {
+            registration::Registration::new(
+                file.clone(),
+                &registration::Origin {
+                    upstream: &config.upstream,
+                    username: &config.username,
+                    password: config.password.as_deref(),
+                    request_timeout: config.request_timeout,
+                },
+                args.service_url.as_deref(),
+                address,
+                args.service_mode,
+                args.service_metadata,
+            )
+        })
+        .transpose()?;
     let shutdown = CancellationToken::new();
     let (router, mut routing, imported) = if let Some(image) = image {
         match image.import(&config, limits.clone(), descriptors, shutdown.clone()) {
@@ -331,6 +394,8 @@ async fn run(args: Arguments, mut descriptors: HashMap<String, OwnedFd>) -> Resu
         imported,
     ));
     tracing::info!(%address, "event gateway listening");
+    let mut registration =
+        registration.map(|registration| tokio::spawn(registration.run(shutdown.clone(), watcher)));
     let _ = systemd::notify(
         notify_socket.as_deref(),
         &format!("READY=1\nSTATUS=event gateway on {address}"),
@@ -366,6 +431,7 @@ async fn run(args: Arguments, mut descriptors: HashMap<String, OwnedFd>) -> Resu
             >,
         ),
         Router(std::result::Result<(), tokio::task::JoinError>),
+        Registration(std::result::Result<(), tokio::task::JoinError>),
     }
     let mut reset = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined2())?;
     let successor = args.handover_successor.unwrap_or(std::env::current_exe()?);
@@ -378,6 +444,12 @@ async fn run(args: Arguments, mut descriptors: HashMap<String, OwnedFd>) -> Resu
             result = stop_signal() => break Stopped::Signal(result),
             result = &mut gateway => break Stopped::Gateway(result),
             result = &mut routing => break Stopped::Router(result),
+            result = async {
+                match &mut registration {
+                    Some(task) => task.await,
+                    None => std::future::pending().await,
+                }
+            } => break Stopped::Registration(result),
             _ = reset.recv() => {
                 if let Some(manager) = &manager {
                     let needed = match reset_router.snapshot().await {
@@ -395,6 +467,13 @@ async fn run(args: Arguments, mut descriptors: HashMap<String, OwnedFd>) -> Resu
     let _ = systemd::notify(notify_socket.as_deref(), "STOPPING=1");
     shutdown.cancel();
     tracing::info!("event gateway stopping");
+    // Discovery restores the origin record when its task observes cancellation;
+    // a registration that overruns shutdown grace is an error, not a retry.
+    if !matches!(stopped, Stopped::Registration(_))
+        && let Some(task) = &mut registration
+    {
+        join_shutdown(task).await?;
+    }
     match stopped {
         Stopped::Signal(result) => {
             result?;
@@ -411,6 +490,14 @@ async fn run(args: Arguments, mut descriptors: HashMap<String, OwnedFd>) -> Resu
             join_shutdown(&mut gateway).await??;
             result?;
             return Err("routing actor exited unexpectedly".into());
+        }
+        Stopped::Registration(result) => {
+            let (gateway, router) =
+                tokio::join!(join_shutdown(&mut gateway), join_shutdown(&mut routing));
+            gateway??;
+            router?;
+            result?;
+            return Err("discovery contribution task exited unexpectedly".into());
         }
     }
     Ok(())

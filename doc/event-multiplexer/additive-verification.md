@@ -128,3 +128,11 @@ These are a new synthetic baseline, not an improvement claim: they include share
 queue/pump and revised metric accounting, and idle/unfollowed traffic still pays
 that machinery's cost. The predecessor measured a different producer structure.
 A comparable production-topology before/after run is still needed for CPU claims.
+
+## Later discovery work (2026-10-11)
+
+[Native discovery verification](discovery-verification.md) complements this
+transport record: publisher contact overrides, daemon endpoint enrichment and
+explicit stomp route unchanged native clients through the same forwarding
+gateway. It re-runs this real-client harness and adds isolated service discovery
+checks; it does not replace the above event-delivery or performance evidence.

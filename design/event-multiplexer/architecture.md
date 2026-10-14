@@ -1,3 +1,17 @@
+---
+type: Design
+title: Rust subscription-aware gateway
+description: Gateway routing, transport and host integration boundaries.
+resource: https://github.com/rektide/opencode-bus-proxy/blob/main/design/event-multiplexer/architecture.md
+status: maintained
+generated: { by: "model:openai/gpt-6.1-sol#medium", at: 2026-10-12 }
+sources:
+  - { resource: "opencode://ses_ed04fa2e4ffe2pYU135EWTc730", title: Clarify concrete service-manager, discovery and daemon supervision ownership }
+  - { resource: "../../crates/daemon/src/main.rs", title: Host composition and startup ordering }
+  - { resource: "../../crates/service-manager/src/lib.rs", title: Listener acquisition and manager integration policy }
+  - { resource: "../../crates/discovery/src/lib.rs", title: Discovery ownership and restoration }
+---
+
 # Rust subscription-aware gateway
 
 Gateway-focused design reference. The maintained whole-system account is
@@ -61,10 +75,30 @@ after the basic topology is measured; it adds synchronization obligations.
 | `bus-proxy-protocol` | Scoped ordinary events, selection contract, bounded SSE decoding, interest validation and native handshake framing             |
 | `bus-proxy-router`   | Subscription lifetime, indexed admission, complete replacement, bounded queues, epoch invalidation, inspectable state/counters |
 | `bus-proxy-gateway`  | Upstream connection/retry, authentication integration, SSE endpoints, streaming HTTP and WebSocket proxying, health/metrics    |
-| `opencode-bus-proxy` | CLI configuration, tracing subscriber, signal/shutdown composition                                                             |
+| `bus-proxy-service-manager` | Complete bind/adopt/store-once listener decision, concrete systemd notification protocol and owned watchdog |
+| `bus-proxy-discovery` | Local record contribution/eligibility/restoration, origin verification and owned watcher bridge |
+| `opencode-bus-proxy` | CLI/credential configuration, tracing subscriber, startup composition and application-specific supervision/shutdown |
 
 Protocol has no network/runtime requirement. Router depends on protocol and Tokio,
-not HTTP. Gateway composes protocol/router with Hyper. Daemon is a thin host.
+not HTTP. Gateway composes protocol/router with Hyper and accepts a plain Tokio
+listener. Service-manager and discovery do not depend on gateway/router: discovery
+receives only its own origin credentials and request policy. Daemon is the host,
+not a generic integration/plugin framework.
+
+The host resolves credentials first, then captures activation state before the
+serving runtime starts. Listener acquisition owns address selection, inherited
+socket rejection of explicit `--listen`, and best-effort fdstore only for a
+self-bound socket. Discovery validates configuration and acquires its record
+ownership lock before serving tasks start. Readiness remains after router/gateway
+and optional discovery task launch; it does not imply upstream source readiness.
+On signal or task exit the host sends stopping, cancels shared shutdown, waits for
+discovery restoration, and joins remaining tasks with the existing ten-second
+per-task grace. Watchdog and watcher handles have scoped owners, so dropping or
+aborting their enclosing lifecycle does not leave detached integrations.
+
+See [operating lifecycle](../../doc/event-multiplexer/operations.md) for socket,
+credential, discovery and shutdown semantics, and the
+[implementation map](../../README.md#layout-and-verification) for entrypoints.
 
 ## Concurrency and bounds
 

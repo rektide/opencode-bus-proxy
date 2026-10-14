@@ -11,6 +11,10 @@ sources:
     title: Native telemetry build/layout/navigation additions; preexisting gateway description retained
   - resource: /telemetry/README.md
     title: Telemetry packages, consumer isolation and optional features
+  - resource: opencode://ses_ed04fa2e4ffe2pYU135EWTc730
+    title: Native discovery feature description and crate rows merged from the branch
+  - resource: opencode://ses_ec367db07ffeXxqPpfAZWBTUkc
+    title: Merge of native-discovery-20261012 into main; layout rows and policy reconciliation
 ---
 
 # OpenCode bus proxy
@@ -32,6 +36,9 @@ operating instructions; bus-smart also works directly without the gateway.
   from arbitrary payload fields.
 - **Same server URL:** other HTTP requests stream to origin; WebSocket upgrades
   are tunneled for PTYs. Direct bus-smart connections keep working.
+- **Native discovery:** optional daemon-owned endpoint markup, plus explicit
+  `stomp` mode to reapply proxy contact after OpenCode republishes. Origin
+  PID/version/password remain unchanged; no client-shell wrapper is needed.
 
 Requires the additive scoped-event extension implemented in the sibling
 [`opencode-bus-smart`](../opencode-bus-smart/packages/protocol/src/groups/event.ts)
@@ -54,6 +61,15 @@ or a systemd credential named with `--credential` (`BUS_PROXY_CREDENTIAL`).
 Configure clients with the proxy URL and their usual
 credentials. Enable the existing `experimental.session_streaming` client setting
 to use selective delivery. Without that setting, bus-smart clients also broadcast.
+
+For ordinary local clients, configure the new server-reg publisher's native
+`OPENCODE_PROXY_URL`, then opt the daemon into `--service-file <absolute path>`.
+Default `cooperate` mode supplements known endpoints without changing the
+publisher's contact. Explicit `--service-mode stomp` also redirects an eligible
+origin record after every publication, including older publishers. Enrichment
+is default-on independently of that routing choice. See
+[native discovery](doc/event-multiplexer/operations.md#native-local-discovery)
+for the reused Effect watcher bridge, ownership and restoration boundaries.
 
 ```sh
 RUST_LOG=info,bus_proxy_gateway=debug target/release/opencode-bus-proxy \
@@ -120,6 +136,8 @@ silently losing frames or holding up other clients.
 | `components/protocol` | Ordinary scoped events, shared selection contract, control and SSE decoding |
 | `components/router`   | Session index, atomic interest replacement, bounded queues, epochs          |
 | `components/gateway`  | Authentication, source lifecycle, HTTP and WebSocket transport              |
+| `components/service-manager` | Standalone listener/notification policy extraction; daemon adoption pending |
+| `components/discovery` | Optional native discovery contribution/restoration and owned Effect watcher |
 | `cli/daemon`          | CLI, tracing, process supervision and shutdown, systemd integration         |
 | `telemetry/core`      | Caller-owned typed telemetry configuration, layers and provider composition |
 | `telemetry/arrow`     | Versioned collector-compatible Arrow schema; optional completed-span projection |
@@ -127,8 +145,13 @@ silently losing frames or holding up other clients.
 
 Package and Rust API names are unchanged. Older design and verification records
 may retain the former `crates/` coordinates; current source navigation uses the
-paths above. The four core packages remain the default workspace members;
-telemetry is selected explicitly by package or daemon feature.
+paths above. The six core packages remain the default workspace members;
+telemetry is selected explicitly by package or daemon feature. In
+[`main.rs`](cli/daemon/src/main.rs) the daemon resolves configuration and
+credentials, captures activation before serving tasks start, acquires a
+listener, prepares discovery ownership, starts router/gateway/registration,
+then supervises a bounded shutdown. Gateway and router have no systemd
+dependency.
 
 ```sh
 cargo test --locked

@@ -417,6 +417,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "bus-proxy-discovery"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "clap",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "bus-proxy-export-arrow"
 version = "0.1.0"
 dependencies = [
@@ -486,6 +508,17 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "bus-proxy-service-manager"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]
@@ -1612,6 +1645,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 name = "opencode-bus-proxy"
 version = "0.1.0"
 dependencies = [
+ "bus-proxy-discovery",
  "bus-proxy-gateway",
  "bus-proxy-protocol",
  "bus-proxy-router",
